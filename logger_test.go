@@ -1376,3 +1376,101 @@ func TestContextCorrelationChainingAndModuleRegistryCap(t *testing.T) {
 		t.Fatalf("expected uncached child module to inherit parent DEBUG level, got %v", overflowSub.Level())
 	}
 }
+
+type shortWriter struct{}
+
+func (shortWriter) Write(p []byte) (int, error) {
+	if len(p) <= 1 {
+		return 0, nil
+	}
+	return len(p) / 2, nil
+}
+
+func TestTimeFormatZeroAllocAndMillErrorReporting(t *testing.T) {
+	// 1. Millisecond time-format cache: timezone isolation & sub-millisecond bypass
+	var buf bytes.Buffer
+	lMilli := MustNew(
+		WithWriter(&buf),
+		WithFormat(FormatJSON),
+		WithTimeFormat(TimeFormatRFC3339Millis),
+	)
+	defer lMilli.Close()
+
+	base := time.Date(2026, 11, 3, 8, 30, 0, 123_456_789, time.UTC)
+	cst := time.FixedZone("CST", 8*3600)
+	rUTC := slog.NewRecord(base, slog.LevelInfo, "utc", 0)
+	rCST := slog.NewRecord(base.In(cst), slog.LevelInfo, "cst", 0) // identical UnixMilli, different Zone!
+	_ = lMilli.Handler().Handle(context.Background(), rUTC)
+	_ = lMilli.Handler().Handle(context.Background(), rCST)
+
+	recs := parseJSONLines(t, buf.Bytes())
+	if len(recs) != 2 || recs[0]["time"] != "2026-11-03T08:30:00.123Z" || recs[1]["time"] != "2026-11-03T16:30:00.123+08:00" {
+		t.Fatalf("unexpected timezone-aware cached times: %#v", recs)
+	}
+
+	if !isRaceEnabled() {
+		lDiscard := MustNew(WithWriter(io.Discard), WithTimeFormat(TimeFormatRFC3339Millis))
+		defer lDiscard.Close()
+		h := lDiscard.Handler()
+		_ = h.Handle(context.Background(), rUTC)
+		allocs := testing.AllocsPerRun(200, func() {
+			_ = h.Handle(context.Background(), rUTC)
+		})
+		if allocs != 0 {
+			t.Fatalf("expected 0 allocs/op on cached WithTimeFormat hit, got %v", allocs)
+		}
+	}
+
+	// Sub-millisecond layout must NOT collapse distinct nanoseconds within same millisecond
+	buf.Reset()
+	lNano := MustNew(WithWriter(&buf), WithTimeFormat(time.RFC3339Nano))
+	defer lNano.Close()
+	_ = lNano.Handler().Handle(context.Background(), slog.NewRecord(base, slog.LevelInfo, "n1", 0))
+	_ = lNano.Handler().Handle(context.Background(), slog.NewRecord(base.Add(500*time.Nanosecond), slog.LevelInfo, "n2", 0))
+	nanoRecs := parseJSONLines(t, buf.Bytes())
+	if len(nanoRecs) != 2 || nanoRecs[0]["time"] == nanoRecs[1]["time"] {
+		t.Fatalf("expected distinct RFC3339Nano timestamps within same ms, got %#v", nanoRecs)
+	}
+
+	// 2. Background lumberjack post-rotation compression failure surfaces via WithErrorHandler
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "app.log")
+	staleBackup := filepath.Join(dir, "app-2026-01-01T00-00-00.000.log")
+	if err := os.WriteFile(staleBackup, []byte("old-log\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-create a non-empty directory at the target .gz path so compressLogFile fails!
+	blockingDir := staleBackup + ".gz"
+	if err := os.MkdirAll(filepath.Join(blockingDir, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var millErrCount atomic.Int32
+	lRot := MustNew(
+		WithConsole(false),
+		WithFile(logPath, FileOptions{MaxSizeMB: 10, LocalTime: false, Compress: true}),
+		WithErrorHandler(func(err error) {
+			if err != nil {
+				millErrCount.Add(1)
+			}
+		}),
+	)
+	lRot.Info("trigger open and mill")
+	if err := lRot.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if millErrCount.Load() == 0 {
+		t.Fatal("expected background lumberjack compression error to be reported to WithErrorHandler")
+	}
+
+	// 3. BufferedWriter short-write detection & non-sticky buffer reset
+	bw := NewBufferedWriter(shortWriter{}, 64, 0)
+	_, _ = bw.Write([]byte("hello world"))
+	if err := bw.Flush(); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("expected io.ErrShortWrite from shortWriter, got %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("expected non-sticky empty buffer on subsequent Flush(), got %v", err)
+	}
+	_ = bw.Close()
+}

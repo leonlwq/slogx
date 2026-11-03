@@ -199,12 +199,9 @@ func WithConfig(cfg Config) Option {
 		}
 
 		if strings.TrimSpace(cfg.SourceLevel) != "" {
-			lvl, err := parseLevelString(cfg.SourceLevel)
-			if err != nil {
-				c.setErr(fmt.Errorf("slogx: invalid source_level %q: %w", cfg.SourceLevel, err))
+			if !c.applySourceLevelStr(cfg.SourceLevel, "source_level") {
 				return
 			}
-			WithSourceLevel(lvl)(c)
 		} else if cfg.AddSource {
 			WithSource(true)(c)
 		}
@@ -333,12 +330,9 @@ func WithEnvPrefix(prefix string) Option {
 			}
 		}
 		if v := get("LOG_SOURCE_LEVEL"); v != "" {
-			lvl, err := parseLevelString(v)
-			if err != nil {
-				c.setErr(fmt.Errorf("slogx: invalid %sLOG_SOURCE_LEVEL %q: %w", prefix, v, err))
+			if !c.applySourceLevelStr(v, prefix+"LOG_SOURCE_LEVEL") {
 				return
 			}
-			WithSourceLevel(lvl)(c)
 		} else if v := get("LOG_ADD_SOURCE"); v != "" {
 			b, err := strconv.ParseBool(v)
 			if err != nil {
@@ -386,6 +380,16 @@ func convertFileConfig(fc FileConfig) (FileOptions, slog.Level, bool, error) {
 		return fo, lvl, true, nil
 	}
 	return fo, 0, false, nil
+}
+
+func (c *config) applySourceLevelStr(raw, field string) bool {
+	lvl, err := parseLevelString(raw)
+	if err != nil {
+		c.setErr(fmt.Errorf("slogx: invalid %s %q: %w", field, raw, err))
+		return false
+	}
+	WithSourceLevel(lvl)(c)
+	return true
 }
 
 func parseLevelString(raw string) (slog.Level, error) {

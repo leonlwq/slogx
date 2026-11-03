@@ -3,6 +3,7 @@ package slogx
 import (
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -230,6 +231,37 @@ func truncateUTF8(s string, maxBytes int) string {
 	return s[:cut] + truncatedSuffix
 }
 
+type cachedTimeEntry struct {
+	unixMilli int64
+	offset    int
+	zone      string
+	attr      slog.Attr
+}
+
+// isMillisecondCacheableLayout reports whether layout has at most millisecond
+// fractional precision (<= 3 digits after '.' or ','), making its output a pure
+// function of (t.UnixMilli(), t.Zone()).
+func isMillisecondCacheableLayout(layout string) bool {
+	if layout == "" || layout == TimeFormatUnixMillis || layout == TimeFormatUnixNano {
+		return false
+	}
+	for i := 0; i < len(layout); i++ {
+		if layout[i] == '.' || layout[i] == ',' {
+			j := i + 1
+			if j < len(layout) && (layout[j] == '0' || layout[j] == '9') {
+				ch := layout[j]
+				for j < len(layout) && layout[j] == ch {
+					j++
+				}
+				if j-(i+1) > 3 {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
 // buildReplaceAttr composes optional attribute rewriters. When no rewriter is
 // configured, it returns nil so Go's stdlib slog uses its zero-boxing fast path.
 func buildReplaceAttr(
@@ -243,6 +275,9 @@ func buildReplaceAttr(
 	if timeFormat == "" && !hasSensitive && maxFieldLen <= 0 && userReplace == nil && !includeNativeSource {
 		return nil
 	}
+
+	cacheMillis := isMillisecondCacheableLayout(timeFormat)
+	var timeCache atomic.Pointer[cachedTimeEntry]
 
 	return func(groups []string, a slog.Attr) slog.Attr {
 		isTopLevel := len(groups) == 0
@@ -268,8 +303,25 @@ func buildReplaceAttr(
 			case TimeFormatUnixNano:
 				a = slog.Int64(slog.TimeKey, t.UnixNano())
 			default:
-				var buf [64]byte
-				a = slog.String(slog.TimeKey, string(t.AppendFormat(buf[:0], timeFormat)))
+				if cacheMillis {
+					ms := t.UnixMilli()
+					zone, offset := t.Zone()
+					if ce := timeCache.Load(); ce != nil && ce.unixMilli == ms && ce.offset == offset && ce.zone == zone {
+						a = ce.attr
+					} else {
+						var buf [64]byte
+						a = slog.String(slog.TimeKey, string(t.AppendFormat(buf[:0], timeFormat)))
+						timeCache.Store(&cachedTimeEntry{
+							unixMilli: ms,
+							offset:    offset,
+							zone:      zone,
+							attr:      a,
+						})
+					}
+				} else {
+					var buf [64]byte
+					a = slog.String(slog.TimeKey, string(t.AppendFormat(buf[:0], timeFormat)))
+				}
 			}
 			if userReplace != nil {
 				return userReplace(groups, a)

@@ -529,6 +529,7 @@ func (sb *sinkBuilder) addFile(fo *FileOptions, colorOpt *bool, leveler slog.Lev
 		LocalTime:        fo.LocalTime,
 		Compress:         fo.Compress,
 		RotationInterval: fo.RotationInterval,
+		OnError:          sb.cfg.onError,
 	}
 
 	var sinkWriter io.Writer
@@ -569,8 +570,7 @@ func (sb *sinkBuilder) addFile(fo *FileOptions, colorOpt *bool, leveler slog.Lev
 	sb.core.syncers = append(sb.core.syncers, syncFn)
 	sb.core.closers = append(sb.core.closers, closeFn)
 	sb.core.rotators = append(sb.core.rotators, func() error {
-		_ = syncFn()
-		return lj.Rotate()
+		return errors.Join(syncFn(), lj.Rotate())
 	})
 	if syncOnError && errFlushFn != nil {
 		sb.errorSyncers = append(sb.errorSyncers, errFlushFn)

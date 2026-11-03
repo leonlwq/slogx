@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"time"
+
+	"github.com/leonlwq/slogx/internal/lumberjack"
 )
 
 // Format specifies the serialized output format of log records.
@@ -21,12 +23,14 @@ const (
 	FormatPretty Format = "pretty"
 
 	// RotateHourly rotates rolling log files at the top of every hour.
-	RotateHourly = time.Hour
+	RotateHourly = lumberjack.RotateHourly
 	// RotateDaily rotates rolling log files at midnight (local or UTC based on LocalTime).
-	RotateDaily = 24 * time.Hour
+	RotateDaily = lumberjack.RotateDaily
 )
 
 // FileOptions configures rolling log files backed by lumberjack.
+// For JSON/YAML/TOML config-file unmarshaling with string intervals ("daily")
+// and true-by-default booleans, prefer FileConfig inside Config.
 type FileOptions struct {
 	Filename         string        `json:"filename" yaml:"filename" toml:"filename"`
 	MaxSizeMB        int           `json:"max_size_mb" yaml:"max_size_mb" toml:"max_size_mb"`

@@ -1,37 +1,59 @@
 # slogx
 
-基于 Go 标准库 `log/slog`（兼容 **Go 1.22+**）与增强型滚动文件写入器打造的生产级、**零外部第三方依赖（Zero-Dependency）** 云原生后端日志库。
+[![Go Reference](https://pkg.go.dev/badge/github.com/leonlwq/slogx.svg)](https://pkg.go.dev/github.com/leonlwq/slogx)
+[![Go Version](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go)](go.mod)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](go.mod)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-## 核心特性
+**`slogx`** is a production-grade, **zero-dependency**, high-performance cloud-native logging library for Go (`1.22+`), built natively on top of the standard library's `log/slog` with a built-in rolling file engine.
 
-- **零外部依赖 & 广泛兼容**：`go.mod` 兼容 **Go 1.22+** 且无任何第三方库，100% 基于标准库构建，彻底杜绝供应链传递依赖风险。
-- **双模高性能 I/O**：
-  - **默认 `BufferedWriter`**：`64KB` 内存缓冲 + `200ms` 定时刷盘 + `Error` 及以上级别立即落盘，大幅减少 `write(2)` 系统调用。
-  - **可选 `AsyncWriter`**：无锁 `sync.Pool` 内存池 + 有界通道 + 单消费者微批聚合（Batch-Drain），将文件写入与轮转完全隔离至后台协程，业务请求尾延迟零磁盘抖动。
-- **全维日志轮转**：支持**按大小轮转** + **按时间周期轮转**（按小时 `RotateHourly` / 按本地自然日零点对齐 `RotateDaily`）+ **Unix `SIGHUP` 信号即时轮转** + 池化 `gzip` 压缩。
-- **云原生链路与元信息**：
-  - 内置 `TraceID` / `SpanID` / `RequestID` 上下文存取器，并支持自定义 `ContextExtractor` 一行对接 OpenTelemetry 或网关上下文。
-  - 初始化时预格式化绑定 `service`、`version`、`env`、`instance`（自动探测 K8s `POD_NAME` / `HOSTNAME`），单条日志零重复序列化开销。
-- **多路异构分流与插件扩展**：支持 `Stdout`（含本地研发友好的 **`FormatPretty`** ANSI 彩色对齐与多行错误/堆栈缩进渲染，自动识别 TTY 与 `NO_COLOR`）+ 多路任意级别/区间滚动文件（`WithSink`）+ 外部原生 `slog.Handler` 插件（`WithHandler`，如 `otelslog` / Sentry）+ `HandlerMiddleware` 拦截链，同格式同级别 Sink 自动共享单次序列化扇出。
-- **全局与子模块分层动态调级**：内置 `Logger.Named("http.auth")` 树形子模块命名空间与无锁动态级别继承，通过 HTTP 管理端点可在线单独开启指定模块的 `DEBUG` 日志而不放大全站日志量。
-- **声明式配置与 12-Factor 环境覆盖**：原生导出带 `json` / `yaml` / `toml` 标签的 `Config` 结构体（`NewFromConfig`）与 `WithEnv()` / `WithEnvPrefix()`，零样板代码直连 Viper / Nacos / K8s ConfigMap。
-- **安全合规、自监控与防雪崩治理**：
-  - 惰性零开销 `Secret`、`MaskPhone`、`MaskEmail`、`MaskString`（实现 `slog.LogValuer`）；
-  - 敏感字段名（如 `password`、`token`、`authorization`）大小写不敏感自动打码；
-  - 大字段按 UTF-8 字符边界安全截断；
-  - `WithErrorHandler` 底层写盘异常与异步队列溢出（`ErrAsyncOverflow`）可观测回调；
-  - `128B` 缓存行对齐无锁分桶 `SamplingHandler` 限流采样，防止日志风暴打满磁盘 IOPS。
-- **极致调用栈性能**：`PC -> slog.Attr`（`"pkg/file.go:line"`）`sync.Map` 进程级缓存，每个日志调用点全生命周期仅解析一次栈帧，后续命中 **0 堆内存分配**，并支持按级别开启（如仅 `Warn+` 记录行号）。
+It bridges the gap between `log/slog`'s standard API and real-world backend operational needs—delivering **zero-allocation (`0 allocs/op`)** steady-state logging, buffered & asynchronous micro-batched file I/O, size/time/`SIGHUP` log rotation, developer-friendly `FormatPretty` console output, hierarchical per-module dynamic log levels, PII masking, and lock-free log-storm protection without pulling in a single third-party dependency.
 
 ---
 
-## 快速开始
+## Features
+
+- **Zero External Dependencies & Full `log/slog` Compatibility**
+  - Requires **Go 1.22+** with **zero** third-party modules in `go.mod`, eliminating transitive supply-chain risks.
+  - Embeds `*slog.Logger` directly and passes Go's official `testing/slogtest` compliance suite.
+- **Dual High-Throughput I/O Modes**
+  - **`BufferedWriter` (Default)**: `64KB` user-space buffer with periodic `200ms` background flushing and immediate auto-flush on `ERROR` and above, cutting `write(2)` syscalls dramatically.
+  - **`AsyncWriter` (Optional)**: Lock-free `sync.Pool` buffers + bounded channel + single-consumer micro-batch draining (`OverflowDrop` or `OverflowBlock`), isolating request tail latency from disk stalls and file rotations.
+- **Built-in Multi-Dimensional Log Rotation**
+  - Supports **size-based** (`MaxSizeMB`), **calendar-aligned time-based** (`RotateHourly`, `RotateDaily`, or custom intervals), and **Unix `SIGHUP`** signal-triggered rotation with pooled `gzip` compression and age/count retention.
+- **Heterogeneous Multi-Sink Routing & Single-Pass Fan-Out**
+  - Route logs simultaneously to `Stdout` (`FormatPretty` with automatic TTY & `NO_COLOR` detection and indented multi-line error/stacktrace blocks), rolling `JSON`/`Text` files, bounded-level sinks (`WithSink` + `LevelFilter`), external `slog.Handler` plugins (`WithHandler`), and AOP-style `HandlerMiddleware` chains.
+  - Sinks sharing the same format and leveler automatically share a single serialization pass.
+- **Dynamic Global & Hierarchical Module Levels**
+  - Create scoped sub-loggers via `log.Named("http").Named("auth")` (`"http.auth"`) with lock-free atomic level inheritance, controllable in-process or remotely via the built-in zero-dependency `net/http` `LevelHandler`.
+- **Declarative Configuration & 12-Factor Environment Overrides**
+  - Ready-to-unmarshal `Config` schema (`json` / `yaml` / `toml` struct tags) via `NewFromConfig`, composable with `WithEnv()` / `WithEnvPrefix()` and programmatic hooks.
+- **Cloud-Native Correlation, Security & Reliability**
+  - Built-in `TraceID` / `SpanID` / `RequestID` context helpers (`1 × O(depth)` lookup, `0 ns` bypass when unused) plus `ContextExtractor` hooks for OpenTelemetry.
+  - Lazy zero-overhead PII masking (`Secret`, `SecretAttr`, `MaskPhone`, `MaskEmail`, `MaskString`), case-insensitive sensitive key redaction, and UTF-8-safe field length truncation.
+  - `128B` cache-line-isolated lock-free `SamplingHandler` (`>50M ops/s` across cores) to prevent failure storms from exhausting disk IOPS.
+  - Operational self-observability via `WithErrorHandler` (`ErrAsyncOverflow` / `AsyncOverflowError`, write/flush/rotation/compression errors).
+- **Zero-Allocation Hot Path Optimizations**
+  - Process-wide `PC -> slog.Attr` (`"pkg/file.go:line"`) caller cache (`sync.Map`), lazy `Stack()` capture, and lock-free atomic millisecond timestamp caching.
+
+---
+
+## Installation
+
+```bash
+go get github.com/leonlwq/slogx@latest
+```
+
+---
+
+## Quick Start
 
 ```go
 package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -44,43 +66,48 @@ func main() {
 		slogx.WithFormat(slogx.FormatJSON),
 		slogx.WithLevel(slog.LevelInfo),
 		slogx.WithConsole(true),
-		slogx.WithConsoleFormat(slogx.FormatPretty), // 控制台输出可读彩色对齐与多行堆栈（自动识别 TTY），文件输出 JSON
+		slogx.WithConsoleFormat(slogx.FormatPretty), // Human-readable console (auto TTY/NO_COLOR) + JSON files
 		slogx.WithFile("logs/app.log", slogx.FileOptions{
 			MaxSizeMB:        100,
 			MaxBackups:       30,
 			MaxAgeDays:       30,
 			LocalTime:        true,
 			Compress:         true,
-			RotationInterval: slogx.RotateDaily, // 按天零点 + 100MB 混合轮转
+			RotationInterval: slogx.RotateDaily, // Rotate at midnight and/or 100MB
 		}),
-		slogx.WithErrorFile("logs/error.log"),        // >= ERROR 独立落盘
-		slogx.WithService("order-api", "v1.2.0", "prod"),
-		slogx.WithSourceLevel(slog.LevelWarn),        // 仅 Warn/Error 附加调用行号
-		slogx.WithSensitiveKeys(),                    // 自动掩码 password/token/authorization 等字段
-		slogx.WithMaxFieldLength(4096),               // 超长字符串 UTF-8 安全截断
-		slogx.WithSampling(slogx.SamplingOptions{     // 防日志风暴：每秒同模板前 100 条全放行，之后每 100 条采样 1 条
+		slogx.WithErrorFile("logs/error.log"),            // Dedicated rolling file for >= ERROR
+		slogx.WithService("order-api", "v1.2.0", "prod"), // Pre-formatted service & K8s pod/host metadata
+		slogx.WithSourceLevel(slog.LevelWarn),            // Attach caller file:line only on WARN+
+		slogx.WithSensitiveKeys(),                        // Auto-redact password, token, authorization, etc.
+		slogx.WithMaxFieldLength(4096),                   // Truncate oversized strings on UTF-8 boundaries
+		slogx.WithSampling(slogx.SamplingOptions{         // Log-storm protection per (Level, Message)
 			Tick:       time.Second,
 			First:      100,
 			Thereafter: 100,
 		}),
 		slogx.WithEnableSIGHUP(true),
-		slogx.WithSetDefault(true), // 可选：设为全局 slog.Default()
+		slogx.WithSetDefault(true),
 	)
-	defer log.Close() // 优雅停机：刷空缓冲区、等待压缩完成并关闭文件句柄
+	defer log.Close() // Flush buffers, finish pending compressions, and close file descriptors
 
-	// 1. 携带链路追踪 ID 打印日志
+	// Propagate correlation IDs via context.Context
 	ctx := slogx.WithTraceID(context.Background(), "4bf92f3577b34da6a3ce929d0e0e4736")
 	ctx = slogx.WithRequestID(ctx, "req-10086")
 
-	log.InfoContext(ctx, "user login",
-		slog.String("phone", "13812345678"), // 若需脱敏可用 slog.Any("phone", slogx.MaskPhone("13812345678"))
-		slog.Any("masked_phone", slogx.MaskPhone("13812345678")),
+	log.InfoContext(ctx, "user authenticated",
+		slog.Any("phone", slogx.MaskPhone("13812345678")),
 		slogx.SecretAttr("access_token", "eyJhbGciOiJIUzI1NiIs..."),
 	)
 
-	// 2. 挂载动态日志级别 HTTP 管理端点
-	// 查询: curl http://127.0.0.1:9090/debug/loglevel
-	// 调级: curl -X PUT http://127.0.0.1:9090/debug/loglevel -d '{"level":"debug"}'
+	log.ErrorContext(ctx, "payment upstream timeout",
+		slog.Any("err", errors.New("rpc deadline exceeded")),
+		slogx.Stack(), // Lazy goroutine stacktrace
+	)
+
+	// Expose runtime HTTP level management endpoint:
+	//   GET  http://127.0.0.1:9090/debug/loglevel
+	//   PUT  http://127.0.0.1:9090/debug/loglevel -d '{"level":"debug"}'
+	//   PUT  http://127.0.0.1:9090/debug/loglevel?module=db&level=debug
 	mux := http.NewServeMux()
 	mux.Handle("/debug/loglevel", log.LevelHandler())
 }
@@ -88,11 +115,11 @@ func main() {
 
 ---
 
-## 进阶用法
+## Advanced Usage
 
-### 1. 开启异步零阻塞写入（`AsyncWriter`）
+### 1. Non-Blocking Asynchronous File I/O (`AsyncWriter`)
 
-在对 P999 尾延迟极度敏感的核心网关或交易服务中，可开启异步微批写入：
+For latency-critical gateways and trading engines, enable `WithAsync` to decouple log I/O and file rotation from business goroutines:
 
 ```go
 log := slogx.MustNew(
@@ -101,59 +128,86 @@ log := slogx.MustNew(
 	slogx.WithAsync(slogx.AsyncOptions{
 		QueueSize:  8192,
 		BufferSize: 64 * 1024,
-		Policy:     slogx.OverflowDrop, // 满载丢弃并记录计数，绝不阻塞业务协程（亦可选 OverflowBlock）
+		Policy:     slogx.OverflowDrop, // Never block callers; or use OverflowBlock
+	}),
+	slogx.WithErrorHandler(func(err error) {
+		if errors.Is(err, slogx.ErrAsyncOverflow) {
+			// Export overflow drop metrics or alerts
+		}
 	}),
 )
 defer log.Close()
 ```
 
-### 2. 零依赖对接 OpenTelemetry Context
+### 2. Declarative Config (`JSON` / `YAML` / `TOML`) & 12-Factor Env Overrides
 
-无需在本库引入任何 OpenTelemetry 依赖，业务项目只需在初始化时注册三行提取闭包：
-
-```go
-slogx.WithContextExtractor(func(ctx context.Context) []slog.Attr {
-	sc := trace.SpanContextFromContext(ctx)
-	if !sc.IsValid() {
-		return nil
-	}
-	return []slog.Attr{
-		slog.String("trace_id", sc.TraceID().String()),
-		slog.String("span_id", sc.SpanID().String()),
-	}
-})
-```
-
-### 3. 声明式配置（JSON / YAML / TOML）与环境变量覆盖
-
-业务微服务可直接将配置文件反序列化至 `slogx.Config`，并叠加 `WithEnv()` 与代码级扩展钩子：
+Unmarshal configuration directly from JSON, YAML, TOML, Viper, koanf, or remote config centers into `slogx.Config`, then layer environment overrides and code hooks:
 
 ```go
 var cfg slogx.Config
-_ = json.Unmarshal(rawConfigBytes, &cfg) // 同样兼容 yaml.v3 / toml / Viper
+if err := json.Unmarshal(rawConfigBytes, &cfg); err != nil {
+	panic(err)
+}
 
 log, err := slogx.NewFromConfig(cfg,
-	slogx.WithEnv(), // 支持 LOG_LEVEL / LOG_MODULE_LEVELS="db=debug" 等环境变量覆盖
-	slogx.WithErrorHandler(func(err error) {
-		if errors.Is(err, slogx.ErrAsyncOverflow) {
-			// 上报异步丢弃告警指标
-		}
-	}),
+	slogx.WithEnv(), // Or slogx.WithEnvPrefix("MYAPP_")
+	slogx.WithErrorHandler(onLogError),
 )
 ```
 
-### 4. 子模块分层动态调级（`Named`）与通用扩展口（`WithSink` / `WithHandler`）
+### 3. Hierarchical Module Levels (`Named`)
+
+Enable fine-grained `DEBUG` logging for a single subsystem in production without flooding global logs:
 
 ```go
-dbLog := log.Named("db") // 自动附加 "logger":"db"，支持树形继承 log.Named("http").Named("auth")
+httpLog := log.Named("http")
+authLog := httpLog.Named("auth") // Emits "logger":"http.auth", inherits from "http" -> root
 
-// 运行时仅开启 db 模块的 DEBUG 日志（亦可通过 PUT /debug/loglevel?module=db&level=debug 在线热更新）：
-log.SetModuleLevel("db", slog.LevelDebug)
+// Dynamically adjust a specific module in code or via HTTP PUT /debug/loglevel?module=http.auth&level=debug
+log.SetModuleLevel("http.auth", slog.LevelDebug)
+
+// Reset module override so it inherits from its parent again
+log.ResetModuleLevel("http.auth")
 ```
 
-### 5. 接管标准库 `http.Server.ErrorLog`
+### 4. Generalized Sinks, External `slog.Handler` Plugins & Middlewares
+
+Integrate custom writers, bounded level ranges, third-party `slog.Handler` implementations (such as `otelslog` or Sentry), and `HandlerMiddleware` decorators:
 
 ```go
+auditFile := slogx.DefaultFileOptions("logs/audit.log")
+
+log := slogx.MustNew(
+	slogx.WithSink(slogx.SinkOptions{
+		File:   &auditFile,
+		Format: slogx.FormatJSON,
+		LevelFilter: func(lvl slog.Level) bool {
+			return lvl >= slog.LevelInfo && lvl < slog.LevelError
+		},
+	}),
+	slogx.WithHandler(otelSlogHandler),
+	slogx.WithHandlerMiddleware(metricsMiddleware),
+)
+```
+
+### 5. OpenTelemetry SpanContext & `http.Server.ErrorLog` Integration
+
+Bridge OpenTelemetry `trace.SpanContext` in three lines without coupling `slogx` to OTel dependencies, and route standard library `*log.Logger` output into structured logs:
+
+```go
+log := slogx.MustNew(
+	slogx.WithContextExtractor(func(ctx context.Context) []slog.Attr {
+		sc := trace.SpanContextFromContext(ctx)
+		if !sc.IsValid() {
+			return nil
+		}
+		return []slog.Attr{
+			slog.String(slogx.TraceIDKey, sc.TraceID().String()),
+			slog.String(slogx.SpanIDKey, sc.SpanID().String()),
+		}
+	}),
+)
+
 srv := &http.Server{
 	Addr:     ":8080",
 	ErrorLog: log.StdLogLogger(slog.LevelWarn),
@@ -162,23 +216,48 @@ srv := &http.Server{
 
 ---
 
-## 性能基准测试（Benchmark）
+## Environment Variables (`WithEnv` / `WithEnvPrefix`)
 
-测试环境：`Go 1.27.3 darwin/arm64 (Apple M4 Pro)`，执行命令 `go test -bench=. -benchmem -run=^$ ./...`：
+| Variable | Example | Description |
+| :--- | :--- | :--- |
+| `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | Global minimum log level |
+| `LOG_MODULE_LEVELS` | `db=debug,http.auth=warn` | Comma-separated per-module level overrides |
+| `LOG_FORMAT` | `json`, `text`, `pretty` | Primary output format |
+| `LOG_TIME_FORMAT` | `2006-01-02T15:04:05.000Z07:00`, `unix_ms` | Timestamp layout or Unix epoch unit |
+| `LOG_CONSOLE` | `true`, `false` | Enable or disable console output |
+| `LOG_CONSOLE_FORMAT` | `pretty`, `json`, `text` | Console-specific format override |
+| `LOG_CONSOLE_COLOR` | `true`, `false` | Force-enable or disable ANSI colors in `pretty` mode |
+| `LOG_FILE` | `/var/log/app/app.log` | Primary rolling log file path |
+| `LOG_ERROR_FILE` | `/var/log/app/error.log` | Dedicated `>= ERROR` rolling log file path |
+| `LOG_ADD_SOURCE` | `true`, `false` | Enable caller `pkg/file.go:line` reporting |
+| `LOG_SOURCE_LEVEL` | `warn`, `error` | Minimum level required to attach caller source |
 
-| 基准测试项 | 耗时 (`ns/op`) | 内存分配 (`B/op`) | 分配次数 (`allocs/op`) | 对比提升 |
+---
+
+## Benchmarks
+
+Measured on `darwin/arm64` (**Apple M4 Pro**, 14 cores) with `go test -bench=. -benchmem -run=^$ .`:
+
+| Benchmark | Latency (`ns/op`) | Bytes (`B/op`) | Allocs (`allocs/op`) | Notes |
 | :--- | ---: | ---: | ---: | :--- |
-| `BenchmarkFileWrite_Unbuffered-14`（旧版无缓冲直写） | `1973 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkFileWrite_Buffered-14`（默认 `64KB` 缓冲写） | **`426.9 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`4.62x` 吞吐提升** |
-| `BenchmarkFileWrite_Async-14`（异步微批写） | **`495.6 ns/op`** | `4 B/op` | **`0 allocs/op`** | **`3.98x` + 零磁盘阻塞** |
-| `BenchmarkParallelFileWrite_Unbuffered-14`（14 核并发直写） | `3313 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkParallelFileWrite_Buffered-14`（14 核并发缓冲写） | **`509.6 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`6.50x` 并发吞吐提升** |
-| `BenchmarkParallelFileWrite_Async-14`（14 核并发异步写） | **`745.5 ns/op`** | `1 B/op` | **`0 allocs/op`** | **`4.44x` + 轮转零毛刺** |
-| `BenchmarkCaller_StdlibAddSourceAndReplaceAttr-14`（旧版调用栈） | `900.5 ns/op` | `601 B/op` | `8 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkCaller_SlogxPCCache-14`（`PC` 缓存 + 快路径） | **`391.5 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.30x` 提速 & 消除全部 8 次分配** |
-| `BenchmarkCaller_SlogxSourceLevelWarn_OnInfo-14`（按级别开启） | **`311.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.89x` 提速 & 0 分配** |
-| `BenchmarkLogStorm_NoSampling-14`（并发风暴无采样） | `211.3 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkLogStorm_WithSampling-14`（14 核单 Key 极限风暴采样） | **`74.59 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.83x` 提速（真实落盘场景 `>40x`）** |
-| `BenchmarkLogStorm_MultiKeyWithSampling-14`（14 核多 Key 128B 隔离分桶采样） | **`18.94 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`11.16x` 提速（`>5200 万 ops/s`）** |
-| `BenchmarkMultiSink_SharedJSON-14`（3 路 JSON 共享序列化 + 脱敏 + 时间格式化） | **`631.9 ns/op`** | `32 B/op` | **`1 allocs/op`** | **单次序列化扇出 + 消除 `slog.Level` 反射** |
-| `BenchmarkConsole_PrettyHandler-14`（ANSI 彩色对齐 `FormatPretty` + `PC` 缓存） | **`369.9 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **池化零分配彩色渲染** |
+| `BenchmarkFileWrite_Unbuffered-14` | `1898 ns/op` | `0 B/op` | `0 allocs/op` | Direct unbuffered file write (`1.0x` baseline) |
+| `BenchmarkFileWrite_Buffered-14` | **`424.2 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`4.47x` faster** (`64KB` `BufferedWriter`) |
+| `BenchmarkFileWrite_Async-14` | **`474.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`4.00x` faster** + non-blocking micro-batched I/O |
+| `BenchmarkParallelFileWrite_Unbuffered-14` | `3203 ns/op` | `0 B/op` | `0 allocs/op` | 14-core parallel direct write (`1.0x` baseline) |
+| `BenchmarkParallelFileWrite_Buffered-14` | **`505.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`6.33x` higher** parallel throughput |
+| `BenchmarkParallelFileWrite_Async-14` | **`755.3 ns/op`** | `4 B/op` | **`0 allocs/op`** | **`4.24x` faster** + zero rotation tail-latency spikes |
+| `BenchmarkCaller_StdlibAddSourceAndReplaceAttr-14` | `848.1 ns/op` | `601 B/op` | `8 allocs/op` | Stdlib `AddSource` + `ReplaceAttr` baseline |
+| `BenchmarkCaller_SlogxPCCache-14` | **`379.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.23x` faster** & eliminates all 8 heap allocs |
+| `BenchmarkCaller_SlogxSourceLevelWarn_OnInfo-14` | **`306.6 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.77x` faster** (`WithSourceLevel(LevelWarn)` on `INFO`) |
+| `BenchmarkLogStorm_NoSampling-14` | `211.0 ns/op` | `0 B/op` | `0 allocs/op` | 14-core log storm without sampling |
+| `BenchmarkLogStorm_WithSampling-14` | **`75.36 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | 14-core single-key storm (`>40x` faster on real disk) |
+| `BenchmarkLogStorm_MultiKeyWithSampling-14` | **`19.32 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`>51M ops/s`** (128B cache-line-isolated buckets) |
+| `BenchmarkMultiSink_SharedJSON-14` | **`524.3 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | 3 JSON sinks + redaction + millisecond time cache |
+| `BenchmarkConsole_PrettyHandler-14` | **`375.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | ANSI `FormatPretty` + caller cache |
+| `BenchmarkContextCorrelation_DeepChain-14` | **`461.4 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | 8-layer `context.Context` chain + 3 correlation IDs |
+
+---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

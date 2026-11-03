@@ -124,20 +124,16 @@ func newBufferedWriter(dst io.Writer, bufSize int, flushInterval time.Duration, 
 }
 
 func (w *BufferedWriter) flushLocked() error {
-	if len(w.buf) == 0 {
+	prevLen := len(w.buf)
+	if prevLen == 0 {
 		return nil
 	}
 	n, err := w.dst.Write(w.buf)
-	if n >= len(w.buf) {
-		w.buf = w.buf[:0]
-		return err
-	}
-	if n > 0 {
-		copy(w.buf, w.buf[n:])
-		w.buf = w.buf[:len(w.buf)-n]
-	}
-	if err == nil {
-		err = io.ErrShortWrite
+	// Always reset the buffer so a transient or sustained destination error
+	// never wedges future log writes in memory.
+	w.buf = w.buf[:0]
+	if err == nil && n < prevLen {
+		return io.ErrShortWrite
 	}
 	return err
 }
@@ -155,9 +151,6 @@ func (w *BufferedWriter) flushLoop(interval time.Duration) {
 			var flushErr error
 			if !w.closed.Load() && len(w.buf) > 0 {
 				flushErr = w.flushLocked()
-				if flushErr != nil {
-					w.buf = w.buf[:0]
-				}
 			}
 			w.mu.Unlock()
 			if flushErr != nil && w.onError != nil {
@@ -182,8 +175,6 @@ func (w *BufferedWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	if err := w.flushLocked(); err != nil {
-		// Discard wedged buffer so sustained disk errors never lock up future writes.
-		w.buf = w.buf[:0]
 		return 0, err
 	}
 	if len(p) >= w.maxCap {
@@ -201,11 +192,7 @@ func (w *BufferedWriter) Flush() error {
 	if w.closed.Load() {
 		return nil
 	}
-	err := w.flushLocked()
-	if err != nil {
-		w.buf = w.buf[:0]
-	}
-	return err
+	return w.flushLocked()
 }
 
 // Sync flushes the in-memory buffer and syncs the underlying writer if supported.
@@ -215,11 +202,7 @@ func (w *BufferedWriter) Sync() error {
 	if w.closed.Load() {
 		return nil
 	}
-	err := w.flushLocked()
-	if err != nil {
-		w.buf = w.buf[:0]
-	}
-	return errors.Join(err, syncUnderlyingDst(w.dst))
+	return errors.Join(w.flushLocked(), syncUnderlyingDst(w.dst))
 }
 
 // Close stops periodic flushing, flushes all remaining buffered bytes, syncs,
@@ -236,9 +219,7 @@ func (w *BufferedWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	err := w.flushLocked()
-	w.buf = w.buf[:0]
-	err = errors.Join(err, syncUnderlyingDst(w.dst))
+	err := errors.Join(w.flushLocked(), syncUnderlyingDst(w.dst))
 	if c, ok := w.dst.(io.Closer); ok {
 		err = errors.Join(err, c.Close())
 	}

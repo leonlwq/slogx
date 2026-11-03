@@ -78,6 +78,10 @@ type Logger struct {
 	// rotated (e.g., RotateHourly or RotateDaily). Zero disables time-based rotation.
 	RotationInterval time.Duration `json:"rotationinterval" yaml:"rotationinterval"`
 
+	// OnError is an optional callback invoked when background post-rotation
+	// gzip compression or old backup removal encounters an error.
+	OnError func(error) `json:"-" yaml:"-"`
+
 	size         int64
 	nextRotateAt time.Time
 	file         *os.File
@@ -411,7 +415,9 @@ func (l *Logger) millRunOnce() error {
 func (l *Logger) millRun(ch <-chan bool, done chan<- struct{}) {
 	defer close(done)
 	for range ch {
-		_ = l.millRunOnce()
+		if err := l.millRunOnce(); err != nil && l.OnError != nil {
+			l.OnError(err)
+		}
 	}
 }
 
