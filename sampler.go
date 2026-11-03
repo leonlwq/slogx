@@ -11,31 +11,34 @@ import (
 // were suppressed by SamplingHandler.
 const SampledDroppedKey = "sampled_dropped"
 
-const samplerBuckets = 4096 // must be power of two
+const (
+	samplerBuckets   = 2048 // must be power of two
+	cacheLinePadSize = 128  // prevents false sharing on both 64B (x86) and 128B (ARM64/Apple Silicon) cache lines
+)
 
 // SamplingOptions configures log storm protection.
 // Within each Tick window, the first First logs with the same (Level, Message)
 // are logged in full; subsequent logs in the same window are logged once every
 // Thereafter occurrences (or dropped completely if Thereafter == 0).
 type SamplingOptions struct {
-	Tick       time.Duration
-	First      int
-	Thereafter int
+	Tick       time.Duration `json:"tick" yaml:"tick" toml:"tick"`
+	First      int           `json:"first" yaml:"first" toml:"first"`
+	Thereafter int           `json:"thereafter" yaml:"thereafter" toml:"thereafter"`
 }
 
 type sampleBucket struct {
-	resetAt atomic.Int64
-	counter atomic.Uint64
-	dropped atomic.Uint64
+	resetAt     atomic.Int64
+	counter     atomic.Uint64
+	pastDropped atomic.Uint64
+	_           [cacheLinePadSize - 24]byte
 }
 
 type samplerState struct {
-	buckets      [samplerBuckets]sampleBucket
-	totalDropped atomic.Uint64
+	buckets [samplerBuckets]sampleBucket
 }
 
-// SamplingHandler wraps an slog.Handler with lock-free rate-limiting per
-// (Level, Message) pair to protect disk I/O during downstream failure storms.
+// SamplingHandler wraps an slog.Handler with lock-free, cache-line-isolated
+// rate-limiting per (Level, Message) pair to protect disk I/O during failure storms.
 type SamplingHandler struct {
 	next       slog.Handler
 	state      *samplerState
@@ -67,12 +70,45 @@ func NewSamplingHandler(next slog.Handler, opts SamplingOptions) *SamplingHandle
 	}
 }
 
+func newSamplingHandlerWithState(next slog.Handler, base *SamplingHandler) *SamplingHandler {
+	return &SamplingHandler{
+		next:       next,
+		state:      base.state,
+		tickNano:   base.tickNano,
+		first:      base.first,
+		thereafter: base.thereafter,
+	}
+}
+
+func (h *SamplingHandler) calcDropped(count uint64) uint64 {
+	if count <= h.first {
+		return 0
+	}
+	excess := count - h.first
+	if h.thereafter == 0 {
+		return excess
+	}
+	return excess - (excess / h.thereafter)
+}
+
+func (h *SamplingHandler) unreportedTailDrops(count uint64) uint64 {
+	if count <= h.first {
+		return 0
+	}
+	excess := count - h.first
+	if h.thereafter == 0 {
+		return excess
+	}
+	return excess % h.thereafter
+}
+
 // Enabled delegates level checking to the wrapped handler.
 func (h *SamplingHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.next.Enabled(ctx, level)
 }
 
-// Handle applies lock-free bucketed sampling before delegating to next.
+// Handle applies lock-free bucketed sampling with a single atomic increment on
+// the hot path and zero cross-bucket shared state contention.
 func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
 	idx := hashLevelAndMsg(r.Level, r.Message) & (samplerBuckets - 1)
 	b := &h.state.buckets[idx]
@@ -87,10 +123,13 @@ func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
 	reset := b.resetAt.Load()
 	if now >= reset {
 		if b.resetAt.CompareAndSwap(reset, now+h.tickNano) {
-			b.counter.Store(1)
-			if prev := b.dropped.Swap(0); prev > 0 {
+			oldCount := b.counter.Swap(1)
+			if oldDrops := h.calcDropped(oldCount); oldDrops > 0 {
+				b.pastDropped.Add(oldDrops)
+			}
+			if tail := h.unreportedTailDrops(oldCount); tail > 0 {
 				r = r.Clone()
-				r.AddAttrs(slog.Uint64(SampledDroppedKey, prev))
+				r.AddAttrs(slog.Uint64(SampledDroppedKey, tail))
 			}
 			return h.next.Handle(ctx, r)
 		}
@@ -101,15 +140,12 @@ func (h *SamplingHandler) Handle(ctx context.Context, r slog.Record) error {
 		return h.next.Handle(ctx, r)
 	}
 	if h.thereafter > 0 && (n-h.first)%h.thereafter == 0 {
-		if prev := b.dropped.Swap(0); prev > 0 {
+		if prev := h.thereafter - 1; prev > 0 {
 			r = r.Clone()
 			r.AddAttrs(slog.Uint64(SampledDroppedKey, prev))
 		}
 		return h.next.Handle(ctx, r)
 	}
-
-	b.dropped.Add(1)
-	h.state.totalDropped.Add(1)
 	return nil
 }
 
@@ -141,9 +177,14 @@ func (h *SamplingHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// Dropped returns the total number of log records suppressed by this sampler.
+// Dropped returns the total number of log records suppressed across all buckets.
 func (h *SamplingHandler) Dropped() uint64 {
-	return h.state.totalDropped.Load()
+	var total uint64
+	for i := range h.state.buckets {
+		b := &h.state.buckets[i]
+		total += b.pastDropped.Load() + h.calcDropped(b.counter.Load())
+	}
+	return total
 }
 
 // hashLevelAndMsg computes an inline 64-bit FNV-1a hash with zero allocations.

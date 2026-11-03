@@ -1,10 +1,10 @@
 # slogx
 
-基于 Go 1.27 官方 `log/slog` 与增强型 `lumberjack` 打造的生产级、**零外部第三方依赖（Zero-Dependency）** 云原生后端日志库。
+基于 Go 标准库 `log/slog`（兼容 **Go 1.22+**）与增强型滚动文件写入器打造的生产级、**零外部第三方依赖（Zero-Dependency）** 云原生后端日志库。
 
 ## 核心特性
 
-- **零外部依赖**：`go.mod` 无任何第三方库，100% 基于 Go 标准库构建，彻底杜绝供应链传递依赖风险。
+- **零外部依赖 & 广泛兼容**：`go.mod` 兼容 **Go 1.22+** 且无任何第三方库，100% 基于标准库构建，彻底杜绝供应链传递依赖风险。
 - **双模高性能 I/O**：
   - **默认 `BufferedWriter`**：`64KB` 内存缓冲 + `200ms` 定时刷盘 + `Error` 及以上级别立即落盘，大幅减少 `write(2)` 系统调用。
   - **可选 `AsyncWriter`**：无锁 `sync.Pool` 内存池 + 有界通道 + 单消费者微批聚合（Batch-Drain），将文件写入与轮转完全隔离至后台协程，业务请求尾延迟零磁盘抖动。
@@ -12,13 +12,15 @@
 - **云原生链路与元信息**：
   - 内置 `TraceID` / `SpanID` / `RequestID` 上下文存取器，并支持自定义 `ContextExtractor` 一行对接 OpenTelemetry 或网关上下文。
   - 初始化时预格式化绑定 `service`、`version`、`env`、`instance`（自动探测 K8s `POD_NAME` / `HOSTNAME`），单条日志零重复序列化开销。
-- **多路异构分流**：基于 Go 1.27 原生 `slog.NewMultiHandler`，同时支持 `Stdout`（如本地可读 `Text`）+ `app.log`（`JSON`）+ `error.log`（独立归集 `>= ERROR` 告警日志，不受动态调级为 `DEBUG` 干扰）。
-- **原子动态调级 + 内置 HTTP 端点**：封装 `slog.LevelVar`，直接提供标准 `net/http.Handler`（`GET` 查询、`PUT/POST` 热更新日志级别），线上排障无需重启容器。
-- **安全合规与防雪崩治理**：
+- **多路异构分流与插件扩展**：支持 `Stdout`（含本地研发友好的 **`FormatPretty`** ANSI 彩色对齐与多行错误/堆栈缩进渲染，自动识别 TTY 与 `NO_COLOR`）+ 多路任意级别/区间滚动文件（`WithSink`）+ 外部原生 `slog.Handler` 插件（`WithHandler`，如 `otelslog` / Sentry）+ `HandlerMiddleware` 拦截链，同格式同级别 Sink 自动共享单次序列化扇出。
+- **全局与子模块分层动态调级**：内置 `Logger.Named("http.auth")` 树形子模块命名空间与无锁动态级别继承，通过 HTTP 管理端点可在线单独开启指定模块的 `DEBUG` 日志而不放大全站日志量。
+- **声明式配置与 12-Factor 环境覆盖**：原生导出带 `json` / `yaml` / `toml` 标签的 `Config` 结构体（`NewFromConfig`）与 `WithEnv()` / `WithEnvPrefix()`，零样板代码直连 Viper / Nacos / K8s ConfigMap。
+- **安全合规、自监控与防雪崩治理**：
   - 惰性零开销 `Secret`、`MaskPhone`、`MaskEmail`、`MaskString`（实现 `slog.LogValuer`）；
   - 敏感字段名（如 `password`、`token`、`authorization`）大小写不敏感自动打码；
-  - 大字段按 UTF-8 字符边界安全截断（防止巨型报文打爆单行上限）；
-  - 无锁分桶 `SamplingHandler` 限流采样，防止下游雪崩引发的日志风暴打满磁盘 IOPS。
+  - 大字段按 UTF-8 字符边界安全截断；
+  - `WithErrorHandler` 底层写盘异常与异步队列溢出（`ErrAsyncOverflow`）可观测回调；
+  - `128B` 缓存行对齐无锁分桶 `SamplingHandler` 限流采样，防止日志风暴打满磁盘 IOPS。
 - **极致调用栈性能**：`PC -> slog.Attr`（`"pkg/file.go:line"`）`sync.Map` 进程级缓存，每个日志调用点全生命周期仅解析一次栈帧，后续命中 **0 堆内存分配**，并支持按级别开启（如仅 `Warn+` 记录行号）。
 
 ---
@@ -42,7 +44,7 @@ func main() {
 		slogx.WithFormat(slogx.FormatJSON),
 		slogx.WithLevel(slog.LevelInfo),
 		slogx.WithConsole(true),
-		slogx.WithConsoleFormat(slogx.FormatText), // 控制台输出可读文本，文件输出 JSON
+		slogx.WithConsoleFormat(slogx.FormatPretty), // 控制台输出可读彩色对齐与多行堆栈（自动识别 TTY），文件输出 JSON
 		slogx.WithFile("logs/app.log", slogx.FileOptions{
 			MaxSizeMB:        100,
 			MaxBackups:       30,
@@ -122,7 +124,34 @@ slogx.WithContextExtractor(func(ctx context.Context) []slog.Attr {
 })
 ```
 
-### 3. 接管标准库 `http.Server.ErrorLog`
+### 3. 声明式配置（JSON / YAML / TOML）与环境变量覆盖
+
+业务微服务可直接将配置文件反序列化至 `slogx.Config`，并叠加 `WithEnv()` 与代码级扩展钩子：
+
+```go
+var cfg slogx.Config
+_ = json.Unmarshal(rawConfigBytes, &cfg) // 同样兼容 yaml.v3 / toml / Viper
+
+log, err := slogx.NewFromConfig(cfg,
+	slogx.WithEnv(), // 支持 LOG_LEVEL / LOG_MODULE_LEVELS="db=debug" 等环境变量覆盖
+	slogx.WithErrorHandler(func(err error) {
+		if errors.Is(err, slogx.ErrAsyncOverflow) {
+			// 上报异步丢弃告警指标
+		}
+	}),
+)
+```
+
+### 4. 子模块分层动态调级（`Named`）与通用扩展口（`WithSink` / `WithHandler`）
+
+```go
+dbLog := log.Named("db") // 自动附加 "logger":"db"，支持树形继承 log.Named("http").Named("auth")
+
+// 运行时仅开启 db 模块的 DEBUG 日志（亦可通过 PUT /debug/loglevel?module=db&level=debug 在线热更新）：
+log.SetModuleLevel("db", slog.LevelDebug)
+```
+
+### 5. 接管标准库 `http.Server.ErrorLog`
 
 ```go
 srv := &http.Server{
@@ -139,14 +168,17 @@ srv := &http.Server{
 
 | 基准测试项 | 耗时 (`ns/op`) | 内存分配 (`B/op`) | 分配次数 (`allocs/op`) | 对比提升 |
 | :--- | ---: | ---: | ---: | :--- |
-| `BenchmarkFileWrite_Unbuffered-14`（旧版无缓冲直写） | `1927 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkFileWrite_Buffered-14`（默认 `64KB` 缓冲写） | **`449.2 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`4.29x` 吞吐提升** |
-| `BenchmarkFileWrite_Async-14`（异步微批写） | **`507.8 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`3.79x` + 零磁盘阻塞** |
-| `BenchmarkParallelFileWrite_Unbuffered-14`（14 核并发直写） | `3238 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkParallelFileWrite_Buffered-14`（14 核并发缓冲写） | **`510.1 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`6.35x` 并发吞吐提升** |
-| `BenchmarkParallelFileWrite_Async-14`（14 核并发异步写） | **`757.8 ns/op`** | `1 B/op` | **`0 allocs/op`** | **`4.27x` + 轮转零毛刺** |
-| `BenchmarkCaller_StdlibAddSourceAndReplaceAttr-14`（旧版调用栈） | `872.4 ns/op` | `601 B/op` | `8 allocs/op` | 基准 (`1.0x`) |
-| `BenchmarkCaller_SlogxPCCache-14`（`PC` 缓存 + 快路径） | **`393.0 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.22x` 提速 & 消除全部 8 次分配** |
-| `BenchmarkCaller_SlogxSourceLevelWarn_OnInfo-14`（按级别开启） | **`308.3 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.83x` 提速 & 0 分配** |
-| `BenchmarkLogStorm_NoSampling-14`（并发风暴无采样） | `215.8 ns/op` | `0 B/op` | `0 allocs/op` | 基准 |
-| `BenchmarkLogStorm_WithSampling-14`（并发风暴开启采样） | **`130.9 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **短路径直接拦截（真实落盘场景 `~25x`）** |
+| `BenchmarkFileWrite_Unbuffered-14`（旧版无缓冲直写） | `1973 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
+| `BenchmarkFileWrite_Buffered-14`（默认 `64KB` 缓冲写） | **`426.9 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`4.62x` 吞吐提升** |
+| `BenchmarkFileWrite_Async-14`（异步微批写） | **`495.6 ns/op`** | `4 B/op` | **`0 allocs/op`** | **`3.98x` + 零磁盘阻塞** |
+| `BenchmarkParallelFileWrite_Unbuffered-14`（14 核并发直写） | `3313 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
+| `BenchmarkParallelFileWrite_Buffered-14`（14 核并发缓冲写） | **`509.6 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`6.50x` 并发吞吐提升** |
+| `BenchmarkParallelFileWrite_Async-14`（14 核并发异步写） | **`745.5 ns/op`** | `1 B/op` | **`0 allocs/op`** | **`4.44x` + 轮转零毛刺** |
+| `BenchmarkCaller_StdlibAddSourceAndReplaceAttr-14`（旧版调用栈） | `900.5 ns/op` | `601 B/op` | `8 allocs/op` | 基准 (`1.0x`) |
+| `BenchmarkCaller_SlogxPCCache-14`（`PC` 缓存 + 快路径） | **`391.5 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.30x` 提速 & 消除全部 8 次分配** |
+| `BenchmarkCaller_SlogxSourceLevelWarn_OnInfo-14`（按级别开启） | **`311.7 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.89x` 提速 & 0 分配** |
+| `BenchmarkLogStorm_NoSampling-14`（并发风暴无采样） | `211.3 ns/op` | `0 B/op` | `0 allocs/op` | 基准 (`1.0x`) |
+| `BenchmarkLogStorm_WithSampling-14`（14 核单 Key 极限风暴采样） | **`74.59 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`2.83x` 提速（真实落盘场景 `>40x`）** |
+| `BenchmarkLogStorm_MultiKeyWithSampling-14`（14 核多 Key 128B 隔离分桶采样） | **`18.94 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **`11.16x` 提速（`>5200 万 ops/s`）** |
+| `BenchmarkMultiSink_SharedJSON-14`（3 路 JSON 共享序列化 + 脱敏 + 时间格式化） | **`631.9 ns/op`** | `32 B/op` | **`1 allocs/op`** | **单次序列化扇出 + 消除 `slog.Level` 反射** |
+| `BenchmarkConsole_PrettyHandler-14`（ANSI 彩色对齐 `FormatPretty` + `PC` 缓存） | **`369.9 ns/op`** | **`0 B/op`** | **`0 allocs/op`** | **池化零分配彩色渲染** |

@@ -2,6 +2,7 @@ package slogx
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strconv"
@@ -20,6 +21,23 @@ const (
 
 // ErrWriterClosed is returned when writing to or rotating a closed writer or Logger.
 var ErrWriterClosed = errors.New("slogx: writer is closed")
+
+// ErrAsyncOverflow is the sentinel error matched via errors.Is when AsyncWriter
+// drops log records due to queue overflow under OverflowDrop.
+var ErrAsyncOverflow = errors.New("slogx: async queue overflow")
+
+// AsyncOverflowError reports a batch of log records dropped by AsyncWriter.
+type AsyncOverflowError struct {
+	Dropped uint64
+}
+
+func (e *AsyncOverflowError) Error() string {
+	return fmt.Sprintf("slogx: async queue overflow, dropped %d log records", e.Dropped)
+}
+
+func (e *AsyncOverflowError) Unwrap() error {
+	return ErrAsyncOverflow
+}
 
 // OverflowPolicy defines how AsyncWriter behaves when its queue is full.
 type OverflowPolicy int
@@ -70,26 +88,32 @@ func syncUnderlyingDst(dst io.Writer) error {
 // optional periodic background flushing to minimize write(2) syscalls while
 // automatically recovering from transient or oversized-write errors.
 type BufferedWriter struct {
-	mu     sync.Mutex
-	dst    io.Writer
-	buf    []byte
-	maxCap int
-	stopCh chan struct{}
-	doneCh chan struct{}
-	closed atomic.Bool
+	mu      sync.Mutex
+	dst     io.Writer
+	buf     []byte
+	maxCap  int
+	stopCh  chan struct{}
+	doneCh  chan struct{}
+	onError ErrorHandler
+	closed  atomic.Bool
 }
 
 // NewBufferedWriter creates a thread-safe buffered writer around dst.
 // If bufSize <= 0, 64KB is used. If flushInterval > 0, a background ticker
 // periodically flushes buffered data.
 func NewBufferedWriter(dst io.Writer, bufSize int, flushInterval time.Duration) *BufferedWriter {
+	return newBufferedWriter(dst, bufSize, flushInterval, nil)
+}
+
+func newBufferedWriter(dst io.Writer, bufSize int, flushInterval time.Duration, onError ErrorHandler) *BufferedWriter {
 	if bufSize <= 0 {
 		bufSize = defaultBufferSize
 	}
 	w := &BufferedWriter{
-		dst:    dst,
-		buf:    make([]byte, 0, bufSize),
-		maxCap: bufSize,
+		dst:     dst,
+		buf:     make([]byte, 0, bufSize),
+		maxCap:  bufSize,
+		onError: onError,
 	}
 	if flushInterval > 0 {
 		w.stopCh = make(chan struct{})
@@ -128,10 +152,17 @@ func (w *BufferedWriter) flushLoop(interval time.Duration) {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
+			var flushErr error
 			if !w.closed.Load() && len(w.buf) > 0 {
-				_ = w.flushLocked()
+				flushErr = w.flushLocked()
+				if flushErr != nil {
+					w.buf = w.buf[:0]
+				}
 			}
 			w.mu.Unlock()
+			if flushErr != nil && w.onError != nil {
+				w.onError(flushErr)
+			}
 		}
 	}
 }
@@ -251,6 +282,7 @@ type AsyncWriter struct {
 	doneCh     chan struct{}
 	policy     OverflowPolicy
 	isJSON     bool
+	onError    ErrorHandler
 	closed     atomic.Bool
 	dropped    atomic.Uint64
 	totalDrops atomic.Uint64
@@ -258,6 +290,10 @@ type AsyncWriter struct {
 
 // NewAsyncWriter creates an asynchronous writer with a single consumer goroutine.
 func NewAsyncWriter(dst io.Writer, queueSize, bufSize int, policy OverflowPolicy, isJSON bool) *AsyncWriter {
+	return newAsyncWriter(dst, queueSize, bufSize, policy, isJSON, nil)
+}
+
+func newAsyncWriter(dst io.Writer, queueSize, bufSize int, policy OverflowPolicy, isJSON bool, onError ErrorHandler) *AsyncWriter {
 	if queueSize <= 0 {
 		queueSize = defaultAsyncQueue
 	}
@@ -274,6 +310,7 @@ func NewAsyncWriter(dst io.Writer, queueSize, bufSize int, policy OverflowPolicy
 		doneCh:   make(chan struct{}),
 		policy:   policy,
 		isJSON:   isJSON,
+		onError:  onError,
 	}
 	go w.consumeLoop()
 	return w
@@ -288,10 +325,11 @@ func (w *AsyncWriter) Write(p []byte) (int, error) {
 	bp := getAsyncBuf(len(p))
 	*bp = append(*bp, p...)
 
+	// Fast path: 2-way select with default compiles to runtime.selectnbsend,
+	// avoiding multi-channel lock sorting and random permutation in selectgo.
 	select {
-	case <-w.stopCh:
-		putAsyncBuf(bp)
-		return 0, ErrWriterClosed
+	case w.dataCh <- bp:
+		return len(p), nil
 	default:
 	}
 
@@ -305,17 +343,19 @@ func (w *AsyncWriter) Write(p []byte) (int, error) {
 		}
 	}
 
-	select {
-	case w.dataCh <- bp:
-		return len(p), nil
-	case <-w.stopCh:
+	if w.closed.Load() {
 		putAsyncBuf(bp)
 		return 0, ErrWriterClosed
-	default:
-		putAsyncBuf(bp)
-		w.dropped.Add(1)
-		w.totalDrops.Add(1)
-		return len(p), nil
+	}
+	putAsyncBuf(bp)
+	w.dropped.Add(1)
+	w.totalDrops.Add(1)
+	return len(p), nil
+}
+
+func (w *AsyncWriter) reportErr(err error) {
+	if err != nil && w.onError != nil {
+		w.onError(err)
 	}
 }
 
@@ -327,9 +367,10 @@ func (w *AsyncWriter) appendBatch(p []byte) {
 		w.batchBuf = append(w.batchBuf, p...)
 		return
 	}
-	_ = w.flushBatch()
+	w.reportErr(w.flushBatch())
 	if len(p) >= w.maxBuf {
-		_, _ = w.dst.Write(p)
+		_, err := w.dst.Write(p)
+		w.reportErr(err)
 		return
 	}
 	w.batchBuf = append(w.batchBuf, p...)
@@ -355,18 +396,19 @@ func (w *AsyncWriter) emitDropNoticeIfAny() {
 	if n == 0 {
 		return
 	}
-	ts := time.Now().Format(time.RFC3339Nano)
+	w.reportErr(&AsyncOverflowError{Dropped: n})
+	now := time.Now()
 	var stack [192]byte
 	line := stack[:0]
 	if w.isJSON {
 		line = append(line, `{"time":"`...)
-		line = append(line, ts...)
+		line = now.AppendFormat(line, time.RFC3339Nano)
 		line = append(line, `","level":"WARN","msg":"slogx: async queue overflow, dropped log records","dropped":`...)
 		line = strconv.AppendUint(line, n, 10)
 		line = append(line, "}\n"...)
 	} else {
 		line = append(line, "time="...)
-		line = append(line, ts...)
+		line = now.AppendFormat(line, time.RFC3339Nano)
 		line = append(line, ` level=WARN msg="slogx: async queue overflow, dropped log records" dropped=`...)
 		line = strconv.AppendUint(line, n, 10)
 		line = append(line, '\n')
@@ -409,15 +451,17 @@ func (w *AsyncWriter) consumeLoop() {
 			for i := 0; i < n; i++ {
 				w.writeBuf(<-w.dataCh)
 			}
-			_ = w.flushBatch()
+			w.reportErr(w.flushBatch())
 
 		case reply := <-w.syncCh:
 			w.drainPending()
-			reply <- w.syncUnderlying()
+			err := w.syncUnderlying()
+			w.reportErr(err)
+			reply <- err
 
 		case <-w.stopCh:
 			w.drainPending()
-			_ = w.syncUnderlying()
+			w.reportErr(w.syncUnderlying())
 			return
 		}
 	}
@@ -455,6 +499,11 @@ func (w *AsyncWriter) Close() error {
 	}
 	close(w.stopCh)
 	<-w.doneCh
+
+	if len(w.dataCh) > 0 {
+		w.drainPending()
+		w.reportErr(w.syncUnderlying())
+	}
 
 	if c, ok := w.dst.(io.Closer); ok {
 		return c.Close()

@@ -13,6 +13,59 @@ import (
 // each call site pays runtime.CallersFrames only once across process lifetime.
 var pcAttrCache sync.Map
 
+// StackKey is the attribute key used by Stack() when attaching goroutine stacktraces.
+const StackKey = "stack"
+
+type stackFrames []uintptr
+
+func (sf stackFrames) format() string {
+	if len(sf) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	frames := runtime.CallersFrames(sf)
+	first := true
+	for {
+		f, more := frames.Next()
+		if f.Function != "" && !strings.HasPrefix(f.Function, "runtime.") {
+			if !first {
+				b.WriteByte('\n')
+			}
+			first = false
+			b.WriteString(f.Function)
+			b.WriteString("\n\t")
+			b.WriteString(formatShortCaller(f.File, f.Line))
+		}
+		if !more {
+			break
+		}
+	}
+	return b.String()
+}
+
+func (sf stackFrames) LogValue() slog.Value {
+	return slog.StringValue(sf.format())
+}
+
+func (sf stackFrames) String() string {
+	return sf.format()
+}
+
+// Stack captures the current goroutine's call stack and returns a lazy slog.Attr
+// ("stack") whose frame symbolization only executes if the log record is enabled.
+// In FormatPretty mode, the stacktrace renders as an indented multi-line block;
+// in FormatJSON mode, it serializes as a standard escaped JSON string.
+func Stack() slog.Attr {
+	var pcs [32]uintptr
+	n := runtime.Callers(2, pcs[:])
+	if n == 0 {
+		return slog.Attr{}
+	}
+	captured := make(stackFrames, n)
+	copy(captured, pcs[:n])
+	return slog.Any(StackKey, captured)
+}
+
 func cachedCallerAttr(pc uintptr) (slog.Attr, bool) {
 	if pc == 0 {
 		return slog.Attr{}, false

@@ -149,34 +149,50 @@ func MaskEmail(email string) slog.LogValuer {
 	return maskedEmail(email)
 }
 
-func normalizeSensitiveKeySet(keys []string) map[string]struct{} {
+type sensitiveMatcher struct {
+	set    map[string]struct{}
+	minLen int
+	maxLen int
+}
+
+func newSensitiveMatcher(keys []string) sensitiveMatcher {
 	if len(keys) == 0 {
-		return nil
+		return sensitiveMatcher{}
 	}
 	set := make(map[string]struct{}, len(keys))
+	minLen := int(^uint(0) >> 1)
+	maxLen := 0
 	for _, k := range keys {
 		k = strings.TrimSpace(strings.ToLower(k))
-		if k != "" {
-			set[k] = struct{}{}
+		if k == "" {
+			continue
+		}
+		set[k] = struct{}{}
+		if len(k) < minLen {
+			minLen = len(k)
+		}
+		if len(k) > maxLen {
+			maxLen = len(k)
 		}
 	}
 	if len(set) == 0 {
-		return nil
+		return sensitiveMatcher{}
 	}
-	return set
+	return sensitiveMatcher{set: set, minLen: minLen, maxLen: maxLen}
 }
 
-// matchSensitiveKey performs case-insensitive lookup without heap allocation
-// for keys up to 64 bytes.
-func matchSensitiveKey(key string, set map[string]struct{}) bool {
-	if key == "" || len(set) == 0 {
+// match performs length-prefiltered, case-insensitive lookup without heap
+// allocation for keys up to 64 bytes.
+func (m sensitiveMatcher) match(key string) bool {
+	n := len(key)
+	if n == 0 || len(m.set) == 0 || n < m.minLen || n > m.maxLen {
 		return false
 	}
-	if _, ok := set[key]; ok {
+	if _, ok := m.set[key]; ok {
 		return true
 	}
 	hasUpper := false
-	for i := 0; i < len(key); i++ {
+	for i := 0; i < n; i++ {
 		if key[i] >= 'A' && key[i] <= 'Z' {
 			hasUpper = true
 			break
@@ -185,19 +201,19 @@ func matchSensitiveKey(key string, set map[string]struct{}) bool {
 	if !hasUpper {
 		return false
 	}
-	if len(key) <= 64 {
+	if n <= 64 {
 		var buf [64]byte
-		for i := 0; i < len(key); i++ {
+		for i := 0; i < n; i++ {
 			c := key[i]
 			if c >= 'A' && c <= 'Z' {
 				c += 'a' - 'A'
 			}
 			buf[i] = c
 		}
-		_, ok := set[string(buf[:len(key)])]
+		_, ok := m.set[string(buf[:n])]
 		return ok
 	}
-	_, ok := set[strings.ToLower(key)]
+	_, ok := m.set[strings.ToLower(key)]
 	return ok
 }
 
@@ -218,12 +234,13 @@ func truncateUTF8(s string, maxBytes int) string {
 // configured, it returns nil so Go's stdlib slog uses its zero-boxing fast path.
 func buildReplaceAttr(
 	timeFormat string,
-	sensitiveSet map[string]struct{},
+	sensitive sensitiveMatcher,
 	maxFieldLen int,
 	userReplace func([]string, slog.Attr) slog.Attr,
 	includeNativeSource bool,
 ) func([]string, slog.Attr) slog.Attr {
-	if timeFormat == "" && len(sensitiveSet) == 0 && maxFieldLen <= 0 && userReplace == nil && !includeNativeSource {
+	hasSensitive := len(sensitive.set) > 0
+	if timeFormat == "" && !hasSensitive && maxFieldLen <= 0 && userReplace == nil && !includeNativeSource {
 		return nil
 	}
 
@@ -251,7 +268,8 @@ func buildReplaceAttr(
 			case TimeFormatUnixNano:
 				a = slog.Int64(slog.TimeKey, t.UnixNano())
 			default:
-				a = slog.String(slog.TimeKey, t.Format(timeFormat))
+				var buf [64]byte
+				a = slog.String(slog.TimeKey, string(t.AppendFormat(buf[:0], timeFormat)))
 			}
 			if userReplace != nil {
 				return userReplace(groups, a)
@@ -259,9 +277,21 @@ func buildReplaceAttr(
 			return a
 		}
 
-		isBuiltinMeta := isTopLevel && (a.Key == slog.TimeKey || a.Key == slog.LevelKey)
+		if isTopLevel && a.Key == slog.LevelKey {
+			if userReplace != nil {
+				a = userReplace(groups, a)
+			}
+			if a.Value.Kind() == slog.KindAny {
+				if lvl, ok := a.Value.Any().(slog.Level); ok {
+					a.Value = slog.StringValue(lvl.String())
+				}
+			}
+			return a
+		}
+
+		isBuiltinMeta := isTopLevel && a.Key == slog.TimeKey
 		isMessageMeta := isTopLevel && a.Key == slog.MessageKey
-		if !isBuiltinMeta && !isMessageMeta && len(sensitiveSet) > 0 && matchSensitiveKey(a.Key, sensitiveSet) {
+		if !isBuiltinMeta && !isMessageMeta && hasSensitive && sensitive.match(a.Key) {
 			a.Value = slog.StringValue(redactedPlaceholder)
 		} else if !isBuiltinMeta && maxFieldLen > 0 && a.Value.Kind() == slog.KindString {
 			if s := a.Value.String(); len(s) > maxFieldLen {

@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,7 @@ import (
 	"testing/slogtest"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 )
 
 func parseJSONLines(t *testing.T, raw []byte) []map[string]any {
@@ -654,5 +657,722 @@ func TestConsoleWriterAndSourceOverride(t *testing.T) {
 	out := consoleBuf.String()
 	if !strings.Contains(out, "msg=hello-console") || !strings.Contains(out, "source=") {
 		t.Fatalf("expected text console output with source on Info, got %q", out)
+	}
+}
+
+func TestSamplingHandlerWindowRolloverAndPadding(t *testing.T) {
+	if sz := unsafe.Sizeof(sampleBucket{}); sz != cacheLinePadSize {
+		t.Fatalf("expected sampleBucket size %d bytes, got %d", cacheLinePadSize, sz)
+	}
+
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	sh := NewSamplingHandler(base, SamplingOptions{
+		Tick:       100 * time.Millisecond,
+		First:      3,
+		Thereafter: 5,
+	})
+
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	send := func(ts time.Time) {
+		r := slog.NewRecord(ts, slog.LevelError, "storm-event", 0)
+		if err := sh.Handle(context.Background(), r); err != nil {
+			t.Fatalf("Handle failed: %v", err)
+		}
+	}
+
+	// Window 1: 10 records -> #1, #2, #3, #8 (sampled_dropped=4) emitted; #4..7 and #9..10 suppressed (total 6 dropped, 2 tail drops).
+	for i := 0; i < 10; i++ {
+		send(t0.Add(time.Duration(i) * time.Millisecond))
+	}
+	if got := sh.Dropped(); got != 6 {
+		t.Fatalf("window 1: expected 6 dropped, got %d", got)
+	}
+	recs := parseJSONLines(t, buf.Bytes())
+	if len(recs) != 4 {
+		t.Fatalf("window 1: expected 4 emitted records, got %d", len(recs))
+	}
+	if recs[3][SampledDroppedKey] != float64(4) {
+		t.Fatalf("window 1: expected 4th emitted record sampled_dropped=4, got %#v", recs[3])
+	}
+
+	// Window 2: 1st record rolls over window and reports the 2 unreported tail drops from Window 1.
+	send(t0.Add(150 * time.Millisecond))
+	if got := sh.Dropped(); got != 6 {
+		t.Fatalf("window 2 rollover: expected 6 dropped, got %d", got)
+	}
+	recs = parseJSONLines(t, buf.Bytes())
+	if len(recs) != 5 || recs[4][SampledDroppedKey] != float64(2) {
+		t.Fatalf("window 2 rollover: expected 5th record sampled_dropped=2, got %#v", recs)
+	}
+
+	// Send 4 more in Window 2 (total 5 in Window 2 -> 3 emitted, 2 suppressed -> cumulative 8 dropped).
+	for i := 1; i <= 4; i++ {
+		send(t0.Add(150*time.Millisecond + time.Duration(i)*time.Millisecond))
+	}
+	if got := sh.Dropped(); got != 8 {
+		t.Fatalf("window 2 end: expected 8 cumulative dropped, got %d", got)
+	}
+
+	// Window 3: Thereafter == 0 mode check
+	var bufZero bytes.Buffer
+	shZero := NewSamplingHandler(slog.NewJSONHandler(&bufZero, nil), SamplingOptions{
+		Tick:       100 * time.Millisecond,
+		First:      2,
+		Thereafter: 0,
+	})
+	for i := 0; i < 7; i++ {
+		r := slog.NewRecord(t0.Add(time.Duration(i)*time.Millisecond), slog.LevelWarn, "drop-all-excess", 0)
+		_ = shZero.Handle(context.Background(), r)
+	}
+	if got := shZero.Dropped(); got != 5 {
+		t.Fatalf("Thereafter=0 window 1: expected 5 dropped, got %d", got)
+	}
+	rNext := slog.NewRecord(t0.Add(200*time.Millisecond), slog.LevelWarn, "drop-all-excess", 0)
+	_ = shZero.Handle(context.Background(), rNext)
+	zeroRecs := parseJSONLines(t, bufZero.Bytes())
+	if len(zeroRecs) != 3 || zeroRecs[2][SampledDroppedKey] != float64(5) {
+		t.Fatalf("Thereafter=0 rollover: expected sampled_dropped=5, got %#v", zeroRecs)
+	}
+}
+
+func TestMultiSinkSharedSerializationAndErrorIsolation(t *testing.T) {
+	var buf1, buf2 bytes.Buffer
+	failing := &flakyWriter{}
+	failing.fail.Store(true)
+
+	var replaceCount atomic.Int64
+	l := MustNew(
+		WithFormat(FormatJSON),
+		WithConsoleWriter(&buf1),
+		WithWriter(failing), // Fails on every Write; must NOT abort buf2!
+		WithWriter(&buf2),
+		WithReplaceAttr(func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == "order_id" {
+				replaceCount.Add(1)
+			}
+			return a
+		}),
+	)
+	defer l.Close()
+
+	l.Info("checkout", slog.String("order_id", "ord-99"))
+
+	// Single-pass serialization: ReplaceAttr for "order_id" runs once despite 3 JSON sinks.
+	if got := replaceCount.Load(); got != 1 {
+		t.Fatalf("expected single ReplaceAttr pass across shared JSON sinks, got %d", got)
+	}
+	recs1 := parseJSONLines(t, buf1.Bytes())
+	recs2 := parseJSONLines(t, buf2.Bytes())
+	if len(recs1) != 1 || len(recs2) != 1 {
+		t.Fatalf("expected both healthy sinks to receive log despite failing sink, got %d and %d", len(recs1), len(recs2))
+	}
+	if recs1[0]["order_id"] != "ord-99" || recs2[0]["order_id"] != "ord-99" {
+		t.Fatalf("unexpected sink payloads: %#v / %#v", recs1[0], recs2[0])
+	}
+}
+
+func TestConcurrentGroupedAndUngroupedWithSourceRace(t *testing.T) {
+	var buf bytes.Buffer // Intentionally unsynchronized writer
+	l := MustNew(
+		WithFormat(FormatJSON),
+		WithConsoleWriter(&buf),
+		WithSource(true),
+	)
+	defer l.Close()
+
+	grouped := l.WithGroup("req")
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(2)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				l.Info("ungrouped", slog.Int("g", id), slog.Int("i", i))
+			}
+		}(g)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				grouped.Info("grouped", slog.Int("g", id), slog.Int("i", i))
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	recs := parseJSONLines(t, buf.Bytes())
+	if len(recs) != 800 {
+		t.Fatalf("expected 800 serialized JSON lines without race/interleaving, got %d", len(recs))
+	}
+}
+
+func isRaceEnabled() bool {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return false
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "-race" && s.Value == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+func TestZeroAllocWithSensitiveKeysAndSource(t *testing.T) {
+	if isRaceEnabled() {
+		t.Skip("skipping exact sync.Pool zero-alloc assertion under -race (sync.Pool drops items randomly under race detector)")
+	}
+	l := MustNew(
+		WithConsole(false),
+		WithWriter(io.Discard),
+		WithFormat(FormatJSON),
+		WithSensitiveKeys(DefaultSensitiveKeys...),
+		WithMaxFieldLength(4096),
+		WithSource(true),
+	)
+	defer l.Close()
+
+	ctx := context.Background()
+	// Warm up PC cache once
+	l.LogAttrs(ctx, slog.LevelInfo, "warmup", slog.String("method", "GET"), slog.String("password", "s3cr3t"))
+
+	allocs := testing.AllocsPerRun(200, func() {
+		l.LogAttrs(ctx, slog.LevelInfo, "steady-state", slog.String("method", "GET"), slog.String("password", "s3cr3t"))
+	})
+	if allocs != 0 {
+		t.Fatalf("expected 0 allocs/op on steady-state JSON log with sensitive redaction + PC cache, got %v", allocs)
+	}
+}
+
+func TestDeclarativeConfigAndEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	appPath := filepath.Join(dir, "app.log")
+	warnPath := filepath.Join(dir, "warn.log")
+	errPath := filepath.Join(dir, "error.log")
+
+	rawJSON := fmt.Sprintf(`{
+		"level": "warn",
+		"module_levels": {"rpc": "error"},
+		"format": "json",
+		"console": false,
+		"file": {"filename": %q, "max_size_mb": 10},
+		"error_file": {"filename": %q, "max_size_mb": 10},
+		"files": [
+			{"filename": %q, "level": "warn", "rotation_interval": "daily"}
+		],
+		"service": {"name": "billing", "version": "v2.0.0", "env": "prod"},
+		"attrs": {"region": "ap-east-1"},
+		"enable_default_sensitive": true,
+		"sensitive_keys": ["card_no"],
+		"max_field_len": 64,
+		"sampling": {"tick": "1s", "first": 100, "thereafter": 100}
+	}`, appPath, errPath, warnPath)
+
+	var cfg Config
+	if err := json.Unmarshal([]byte(rawJSON), &cfg); err != nil {
+		t.Fatalf("Unmarshal Config failed: %v", err)
+	}
+
+	t.Setenv("BILLING_LOG_LEVEL", "info")
+	t.Setenv("BILLING_LOG_MODULE_LEVELS", "db=debug, rpc=warn")
+
+	l, err := NewFromConfig(cfg, WithEnvPrefix("BILLING_"))
+	if err != nil {
+		t.Fatalf("NewFromConfig failed: %v", err)
+	}
+
+	if l.Level() != slog.LevelInfo {
+		t.Fatalf("expected env override level INFO, got %v", l.Level())
+	}
+
+	dbLog := l.Named("db")
+	rpcLog := l.Named("rpc")
+
+	l.Debug("root-debug-dropped")
+	dbLog.Debug("db-debug-kept", slog.String("card_no", "4111222233334444"))
+	rpcLog.Info("rpc-info-dropped")
+	rpcLog.Warn("rpc-warn-kept")
+	l.Error("root-err-kept")
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	appRecs := parseJSONLines(t, mustReadFile(t, appPath))
+	warnRecs := parseJSONLines(t, mustReadFile(t, warnPath))
+	errRecs := parseJSONLines(t, mustReadFile(t, errPath))
+
+	if len(appRecs) != 3 {
+		t.Fatalf("expected 3 records in app.log (db debug, rpc warn, root err), got %d: %#v", len(appRecs), appRecs)
+	}
+	if appRecs[0]["card_no"] != "***" || appRecs[0]["region"] != "ap-east-1" || appRecs[0]["service"] != "billing" {
+		t.Fatalf("unexpected attributes in app.log[0]: %#v", appRecs[0])
+	}
+	if len(warnRecs) != 2 {
+		t.Fatalf("expected 2 records in warn.log (rpc warn, root err), got %d", len(warnRecs))
+	}
+	if len(errRecs) != 1 || errRecs[0]["msg"] != "root-err-kept" {
+		t.Fatalf("expected 1 record in error.log, got %#v", errRecs)
+	}
+
+	// Verify config validation errors
+	if _, err := NewFromConfig(Config{Async: &AsyncConfig{Enabled: true, Policy: "invalid"}}); err == nil {
+		t.Fatal("expected error for invalid async policy")
+	}
+	if _, err := NewFromConfig(Config{File: &FileConfig{Filename: appPath, RotationInterval: "bad"}}); err == nil {
+		t.Fatal("expected error for invalid rotation_interval")
+	}
+}
+
+func mustReadFile(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", p, err)
+	}
+	return b
+}
+
+func TestGeneralizedSinksAndLevelFilter(t *testing.T) {
+	dir := t.TempDir()
+	auditPath := filepath.Join(dir, "audit.log")
+	auditOpts := DefaultFileOptions(auditPath)
+
+	var infoOnlyBuf, customBuf bytes.Buffer
+	var synced, closed atomic.Int32
+
+	l := MustNew(
+		WithLevel(slog.LevelInfo),
+		// Sink 1: exact bounded range [INFO, WARN) -> excludes WARN and ERROR!
+		WithSink(SinkOptions{
+			Writer: &infoOnlyBuf,
+			Format: FormatJSON,
+			LevelFilter: func(lvl slog.Level) bool {
+				return lvl < slog.LevelWarn
+			},
+		}),
+		// Sink 2: extra rolling file at WARN+ in Text format
+		WithSink(SinkOptions{
+			File:   &auditOpts,
+			Format: FormatText,
+			Level:  slog.LevelWarn,
+		}),
+		// Sink 3: custom managed writer with SyncFn & CloseFn lifecycle hooks
+		WithSink(SinkOptions{
+			Writer:  &customBuf,
+			Format:  FormatJSON,
+			SyncFn:  func() error { synced.Add(1); return nil },
+			CloseFn: func() error { closed.Add(1); return nil },
+		}),
+	)
+
+	l.Info("info-msg")
+	l.Warn("warn-msg")
+	l.Error("err-msg")
+
+	if err := l.Sync(); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+	if synced.Load() == 0 {
+		t.Fatal("expected SinkOptions.SyncFn to be invoked on Logger.Sync()")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if closed.Load() != 1 {
+		t.Fatalf("expected SinkOptions.CloseFn to be invoked once, got %d", closed.Load())
+	}
+
+	// Writes after Close must not hit customBuf
+	l.Info("after-close")
+
+	infoRecs := parseJSONLines(t, infoOnlyBuf.Bytes())
+	if len(infoRecs) != 1 || infoRecs[0]["msg"] != "info-msg" {
+		t.Fatalf("expected infoOnlyBuf to contain only info-msg, got %#v", infoRecs)
+	}
+	customRecs := parseJSONLines(t, customBuf.Bytes())
+	if len(customRecs) != 3 {
+		t.Fatalf("expected customBuf to contain 3 pre-close records, got %d", len(customRecs))
+	}
+	auditText := string(mustReadFile(t, auditPath))
+	if strings.Contains(auditText, "info-msg") || !strings.Contains(auditText, "warn-msg") || !strings.Contains(auditText, "err-msg") {
+		t.Fatalf("unexpected audit.log text content: %q", auditText)
+	}
+
+	// Invalid SinkOptions check
+	if _, err := New(WithSink(SinkOptions{})); err == nil {
+		t.Fatal("expected error for empty SinkOptions")
+	}
+}
+
+type OrderMiddleware struct {
+	slog.Handler
+	tag   string
+	order *[]string
+}
+
+func (m *OrderMiddleware) Handle(ctx context.Context, r slog.Record) error {
+	*m.order = append(*m.order, m.tag)
+	return m.Handler.Handle(ctx, r)
+}
+
+func (m *OrderMiddleware) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &OrderMiddleware{Handler: m.Handler.WithAttrs(attrs), tag: m.tag, order: m.order}
+}
+
+func (m *OrderMiddleware) WithGroup(name string) slog.Handler {
+	return &OrderMiddleware{Handler: m.Handler.WithGroup(name), tag: m.tag, order: m.order}
+}
+
+func TestExternalHandlerAndMiddlewareChain(t *testing.T) {
+	var extBuf, sinkBuf bytes.Buffer
+	extHandler := slog.NewJSONHandler(&extBuf, nil)
+
+	var order []string
+	mw1 := func(next slog.Handler) slog.Handler {
+		return &OrderMiddleware{Handler: next, tag: "mw1", order: &order}
+	}
+	mw2 := func(next slog.Handler) slog.Handler {
+		return &OrderMiddleware{Handler: next, tag: "mw2", order: &order}
+	}
+
+	l := MustNew(
+		WithWriter(&sinkBuf),
+		WithHandler(extHandler),
+		WithService("auth-svc", "v1.0.0", "dev"),
+		WithSource(true),
+		WithHandlerMiddleware(mw1, mw2),
+	)
+	defer l.Close()
+
+	ctx := WithTraceID(context.Background(), "trace-abc")
+	l.WithGroup("req").InfoContext(ctx, "token issued", slog.String("user", "bob"))
+
+	if strings.Join(order, "->") != "mw1->mw2" {
+		t.Fatalf("expected middleware order mw1->mw2, got %v", order)
+	}
+
+	extRecs := parseJSONLines(t, extBuf.Bytes())
+	sinkRecs := parseJSONLines(t, sinkBuf.Bytes())
+	if len(extRecs) != 1 || len(sinkRecs) != 1 {
+		t.Fatalf("expected 1 record in both external handler and writer sink, got %d / %d", len(extRecs), len(sinkRecs))
+	}
+	if extRecs[0]["service"] != "auth-svc" {
+		t.Fatalf("expected pre-formatted service attr on external handler, got %#v", extRecs[0])
+	}
+	reqGrp, _ := extRecs[0]["req"].(map[string]any)
+	if reqGrp["user"] != "bob" || reqGrp["trace_id"] != "trace-abc" {
+		t.Fatalf("expected grouped attrs and trace_id in external handler, got %#v", extRecs[0])
+	}
+}
+
+type blockingSlowWriter struct {
+	unblock chan struct{}
+	buf     bytes.Buffer
+	mu      sync.Mutex
+}
+
+func (b *blockingSlowWriter) Write(p []byte) (int, error) {
+	<-b.unblock
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func TestErrorHandlerHookAndAsyncOverflowError(t *testing.T) {
+	// 1. Synchronous write failure reported to ErrorHandler
+	failing := &flakyWriter{}
+	failing.fail.Store(true)
+
+	var syncErrCount atomic.Int32
+	lSync := MustNew(
+		WithWriter(failing),
+		WithErrorHandler(func(err error) {
+			if err != nil {
+				syncErrCount.Add(1)
+			}
+		}),
+	)
+	lSync.Info("triggers-write-err")
+	_ = lSync.Close()
+	if syncErrCount.Load() != 1 {
+		t.Fatalf("expected ErrorHandler to receive 1 write error, got %d", syncErrCount.Load())
+	}
+
+	// 2. AsyncWriter queue overflow reported via AsyncOverflowError (errors.Is / errors.As)
+	slow := &blockingSlowWriter{unblock: make(chan struct{})}
+	var overflowReported atomic.Uint64
+	aw := newAsyncWriter(slow, 2, 1024, OverflowDrop, true, func(err error) {
+		if errors.Is(err, ErrAsyncOverflow) {
+			var oe *AsyncOverflowError
+			if errors.As(err, &oe) {
+				overflowReported.Add(oe.Dropped)
+			}
+		}
+	})
+
+	for i := 0; i < 30; i++ {
+		_, _ = aw.Write([]byte(`{"msg":"flood"}` + "\n"))
+	}
+	close(slow.unblock)
+	_ = aw.Close()
+
+	if aw.Dropped() == 0 || overflowReported.Load() != aw.Dropped() {
+		t.Fatalf("expected AsyncOverflowError count (%d) to equal aw.Dropped() (%d)", overflowReported.Load(), aw.Dropped())
+	}
+}
+
+func TestNamedModuleLevelsAndHTTPManagement(t *testing.T) {
+	var buf bytes.Buffer
+	l := MustNew(
+		WithWriter(&buf),
+		WithFormat(FormatJSON),
+		WithLevel(slog.LevelInfo),
+	)
+	defer l.Close()
+
+	httpLog := l.Named("http")
+	authLog := httpLog.Named("auth")
+	if authLog.Name() != "http.auth" || l.Name() != "" {
+		t.Fatalf("unexpected logger names: auth=%q root=%q", authLog.Name(), l.Name())
+	}
+
+	// Initially root=INFO -> DEBUG suppressed on authLog
+	authLog.Debug("hidden-1")
+	if buf.Len() != 0 {
+		t.Fatalf("expected debug suppressed before module override, got %s", buf.String())
+	}
+
+	h := l.LevelHandler()
+
+	// Enable DEBUG on parent module "http" via HTTP PUT -> "http.auth" inherits DEBUG!
+	req := httptest.NewRequest(http.MethodPut, "/debug/loglevel?module=http&level=debug", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || authLog.Level() != slog.LevelDebug || l.Level() != slog.LevelInfo {
+		t.Fatalf("module override failed: code=%d authLevel=%v rootLevel=%v", rec.Code, authLog.Level(), l.Level())
+	}
+
+	l.Debug("root-still-hidden")
+	authLog.Debug("auth-debug-visible")
+
+	// Narrow child "http.auth" to WARN via JSON body while "http" stays DEBUG
+	req = httptest.NewRequest(http.MethodPut, "/debug/loglevel", strings.NewReader(`{"module":"http.auth","level":"warn"}`))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || authLog.Level() != slog.LevelWarn || httpLog.Level() != slog.LevelDebug {
+		t.Fatalf("child override failed: code=%d auth=%v http=%v", rec.Code, authLog.Level(), httpLog.Level())
+	}
+
+	// GET snapshot includes modules map, and GET ?module=http.auth returns WARN
+	req = httptest.NewRequest(http.MethodGet, "/debug/loglevel", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"http.auth":"WARN"`) {
+		t.Fatalf("expected modules snapshot in GET, got %s", rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/debug/loglevel?module=http.auth", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"level":"WARN"`) {
+		t.Fatalf("expected module WARN on GET ?module=http.auth, got %s", rec.Body.String())
+	}
+
+	// Reset both overrides -> authLog returns to INFO
+	req = httptest.NewRequest(http.MethodPut, "/debug/loglevel?module=http.auth&level=reset", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	l.ResetModuleLevel("http")
+	if authLog.Level() != slog.LevelInfo || len(l.ModuleLevels()) != 0 {
+		t.Fatalf("expected reset back to INFO with empty overrides, got level=%v map=%v", authLog.Level(), l.ModuleLevels())
+	}
+
+	// Ensure nested Named("http").Named("auth") emitted a single "logger":"http.auth" key without duplicate "logger" keys!
+	rawLine := strings.TrimSpace(buf.String())
+	if strings.Count(rawLine, `"logger":`) != 1 {
+		t.Fatalf("expected exactly one logger key in JSON output, got %s", rawLine)
+	}
+	recs := parseJSONLines(t, buf.Bytes())
+	if len(recs) != 1 || recs[0]["logger"] != "http.auth" || recs[0]["msg"] != "auth-debug-visible" {
+		t.Fatalf("unexpected records: %#v", recs)
+	}
+}
+
+func TestPrettyHandlerColorMultilineAndStack(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "app.json")
+
+	var prettyPlainBuf, prettyColorBuf bytes.Buffer
+	l := MustNew(
+		WithFormat(FormatJSON),
+		WithConsoleWriter(&prettyPlainBuf),
+		WithConsoleFormat(FormatPretty), // Auto color on bytes.Buffer -> plain (no ANSI)
+		WithSink(SinkOptions{
+			Writer: &prettyColorBuf,
+			Format: FormatPretty,
+			Color:  Bool(true), // Explicit ANSI color enabled
+		}),
+		WithFile(jsonPath, FileOptions{MaxSizeMB: 10, LocalTime: true}),
+		WithSource(true),
+		WithSensitiveKeys(),
+	)
+
+	multiErr := errors.New("rpc failed:\n  upstream reset by peer\n  attempts=3")
+	l.WithGroup("order").Info("created", slog.String("id", "ord-7"), slog.String("secret", "top-secret"))
+	l.WithGroup("empty_grp").Info("no-group-attrs")
+	l.Error("checkout panicked", slog.Any("err", multiErr), Stack())
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	plainOut := prettyPlainBuf.String()
+	colorOut := prettyColorBuf.String()
+
+	if strings.Contains(plainOut, "\x1b[") {
+		t.Fatalf("expected auto-detected bytes.Buffer pretty output to contain no ANSI codes, got %q", plainOut)
+	}
+	if !strings.Contains(colorOut, "\x1b[32mINFO ") || !strings.Contains(colorOut, "\x1b[1;31mERROR") {
+		t.Fatalf("expected forced-color pretty output to contain ANSI level badges, got %q", colorOut)
+	}
+	if !strings.Contains(plainOut, "order.id=ord-7") || !strings.Contains(plainOut, "order.secret=***") {
+		t.Fatalf("expected grouped inline attrs and redaction in pretty output, got:\n%s", plainOut)
+	}
+	if strings.Contains(plainOut, "empty_grp") {
+		t.Fatalf("expected empty WithGroup to be omitted in pretty output, got:\n%s", plainOut)
+	}
+	if !strings.Contains(plainOut, "\n  err:\n    rpc failed:\n      upstream reset by peer") {
+		t.Fatalf("expected indented multi-line error block in pretty output, got:\n%s", plainOut)
+	}
+	if !strings.Contains(plainOut, "\n  stack:\n    ") || !strings.Contains(plainOut, "logger_test.go:") {
+		t.Fatalf("expected indented stacktrace block in pretty output, got:\n%s", plainOut)
+	}
+
+	// Meanwhile app.json must remain valid newline-delimited JSON!
+	jsonRecs := parseJSONLines(t, mustReadFile(t, jsonPath))
+	if len(jsonRecs) != 3 {
+		t.Fatalf("expected 3 valid JSON lines in app.json alongside pretty console, got %d", len(jsonRecs))
+	}
+	stackStr, _ := jsonRecs[2][StackKey].(string)
+	if !strings.Contains(stackStr, "TestPrettyHandlerColorMultilineAndStack") {
+		t.Fatalf("expected JSON stack field to contain test function name, got %q", stackStr)
+	}
+
+	// Verify NO_COLOR suppresses color even on a character device (os.DevNull on Unix).
+	if devNull, err := os.Open(os.DevNull); err == nil {
+		defer devNull.Close()
+		t.Setenv("NO_COLOR", "1")
+		if shouldColorize(devNull, nil) {
+			t.Fatal("expected NO_COLOR=1 to disable auto colorization on char device")
+		}
+	}
+
+	// Verify 0 allocs/op on steady-state PrettyHandler
+	if !isRaceEnabled() {
+		ph := NewPrettyHandler(io.Discard, &PrettyOptions{Color: Bool(true)})
+		pl := slog.New(ph)
+		ctx := context.Background()
+		pl.LogAttrs(ctx, slog.LevelInfo, "warmup", slog.String("k", "v"), slog.Int("n", 1))
+		allocs := testing.AllocsPerRun(200, func() {
+			pl.LogAttrs(ctx, slog.LevelInfo, "steady", slog.String("k", "v"), slog.Int("n", 1))
+		})
+		if allocs != 0 {
+			t.Fatalf("expected 0 allocs/op for PrettyHandler steady-state, got %v", allocs)
+		}
+	}
+}
+
+func TestMultiHandlerAndDiscardHandler(t *testing.T) {
+	// Empty combine -> discardHandler
+	dh := newMultiHandler(nil, discardHandler{})
+	if dh.Enabled(context.Background(), slog.LevelError) {
+		t.Fatal("expected discardHandler.Enabled to be false")
+	}
+	if err := dh.WithAttrs([]slog.Attr{slog.Int("a", 1)}).WithGroup("g").Handle(context.Background(), slog.Record{}); err != nil {
+		t.Fatalf("unexpected discardHandler error: %v", err)
+	}
+
+	var b1, b2 bytes.Buffer
+	failing := &flakyWriter{}
+	failing.fail.Store(true)
+
+	h1 := slog.NewJSONHandler(&b1, nil)
+	hFail := slog.NewJSONHandler(failing, nil)
+	h2 := slog.NewJSONHandler(&b2, nil)
+
+	// Nested multiHandler flattening + error non-short-circuiting
+	nested := newMultiHandler(h1, newMultiHandler(hFail, h2))
+	sl := slog.New(nested.WithAttrs([]slog.Attr{slog.String("env", "test")}).WithGroup("g"))
+	sl.Info("fanout", slog.Int("x", 1))
+
+	r1 := parseJSONLines(t, b1.Bytes())
+	r2 := parseJSONLines(t, b2.Bytes())
+	if len(r1) != 1 || len(r2) != 1 {
+		t.Fatalf("expected both healthy handlers in multiHandler to receive record, got %d / %d", len(r1), len(r2))
+	}
+}
+
+func TestContextCorrelationChainingAndModuleRegistryCap(t *testing.T) {
+	// 1. Nil & chained correlation context preservation + partial child override
+	if TraceID(nil) != "" || SpanID(nil) != "" || RequestID(nil) != "" {
+		t.Fatal("expected empty correlation IDs for nil context")
+	}
+	parentCtx := WithTraceID(nil, "trace-1")
+	parentCtx = WithSpanID(parentCtx, "span-parent")
+	parentCtx = WithRequestID(parentCtx, "req-1")
+
+	childCtx := WithSpanID(parentCtx, "span-child")
+	if TraceID(childCtx) != "trace-1" || SpanID(childCtx) != "span-child" || RequestID(childCtx) != "req-1" {
+		t.Fatalf("unexpected childCtx correlation: trace=%q span=%q req=%q", TraceID(childCtx), SpanID(childCtx), RequestID(childCtx))
+	}
+	// Parent context must remain immutable!
+	if SpanID(parentCtx) != "span-parent" {
+		t.Fatalf("parentCtx mutated by child WithSpanID: got %q", SpanID(parentCtx))
+	}
+
+	// 2. Option validation errors on invalid level / empty module
+	if _, err := New(WithLevelString("bogus-level")); err == nil {
+		t.Fatal("expected error for invalid WithLevelString")
+	}
+	if _, err := New(WithModuleLevel(" . ", slog.LevelDebug)); err == nil {
+		t.Fatal("expected error for empty WithModuleLevel")
+	}
+	if _, err := New(WithModuleLevelString("db", "bogus-level")); err == nil {
+		t.Fatal("expected error for invalid WithModuleLevelString")
+	}
+
+	// 3. Read-only HTTP GET ?module=... must not insert into moduleRegistry, and
+	// unbounded dynamic Named(...) calls must stay capped at maxRegisteredModules.
+	l := MustNew(WithWriter(io.Discard), WithLevel(slog.LevelInfo))
+	defer l.Close()
+
+	h := l.LevelHandler()
+	req := httptest.NewRequest(http.MethodGet, "/debug/level?module=ephemeral.probe", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	l.core.modules.mu.Lock()
+	afterGetLen := len(l.core.modules.nodes)
+	l.core.modules.mu.Unlock()
+	if afterGetLen != 0 {
+		t.Fatalf("expected GET ?module=... to allocate 0 moduleRegistry nodes, got %d", afterGetLen)
+	}
+
+	l.SetModuleLevel("tenant", slog.LevelDebug)
+	for i := 0; i < maxRegisteredModules+1000; i++ {
+		_ = l.Named(fmt.Sprintf("tenant.u_%d", i))
+	}
+	l.core.modules.mu.Lock()
+	cappedLen := len(l.core.modules.nodes)
+	l.core.modules.mu.Unlock()
+	if cappedLen > maxRegisteredModules {
+		t.Fatalf("expected moduleRegistry nodes <= %d, got %d", maxRegisteredModules, cappedLen)
+	}
+
+	// Even an uncached sub-logger created after reaching the cap must inherit parent ("tenant") DEBUG level!
+	overflowSub := l.Named("tenant.u_overflow_999999")
+	if overflowSub.Level() != slog.LevelDebug {
+		t.Fatalf("expected uncached child module to inherit parent DEBUG level, got %v", overflowSub.Level())
 	}
 }

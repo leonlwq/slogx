@@ -2,6 +2,7 @@ package slogx_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -40,6 +41,31 @@ func ExampleNew() {
 	// {"level":"INFO","msg":"user login","phone":"138****5678","password":"***","trace_id":"4bf92f3577b34da6"}
 }
 
+func ExampleNewFromConfig() {
+	rawJSON := `{
+		"level": "info",
+		"module_levels": {"db": "debug"},
+		"format": "json",
+		"enable_default_sensitive": true
+	}`
+	var cfg slogx.Config
+	if err := json.Unmarshal([]byte(rawJSON), &cfg); err != nil {
+		panic(err)
+	}
+
+	log := slogx.MustNewFromConfig(cfg,
+		slogx.WithConsoleWriter(os.Stdout),
+		slogx.WithReplaceAttr(omitTimeAttr),
+	)
+	defer log.Close()
+
+	log.Debug("root debug suppressed")
+	dbLog := log.Named("db")
+	dbLog.Debug("query executed", slog.String("api_key", "secret-key"))
+	// Output:
+	// {"level":"DEBUG","msg":"query executed","logger":"db","api_key":"***"}
+}
+
 func ExampleLogger_LevelHandler() {
 	log := slogx.MustNew(slogx.WithConsole(false))
 	defer log.Close()
@@ -53,3 +79,13 @@ func ExampleLogger_LevelHandler() {
 	// {"level":"DEBUG"}
 }
 
+func ExampleNewPrettyHandler() {
+	h := slogx.NewPrettyHandler(os.Stdout, &slogx.PrettyOptions{
+		Color:       slogx.Bool(false),
+		ReplaceAttr: omitTimeAttr,
+	})
+	log := slog.New(h)
+	log.Info("server started", slog.String("addr", ":8080"))
+	// Output:
+	// INFO  server started addr=:8080
+}
